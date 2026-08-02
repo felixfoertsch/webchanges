@@ -67,4 +67,4 @@
    _api/webchanges
 
 
-.. include:: ../README.rst
+.. include:: upstream-readme.rst
