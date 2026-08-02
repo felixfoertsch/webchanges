@@ -1,3 +1,19 @@
+Downstream patches
+=================
+
+Applied in order from `automation patches <https://github.com/felixfoertsch/webchanges/tree/automation/patches>`__:
+
+- ``0001-add-OpenAI-compatible-AI-differ.patch``
+- ``0002-support-file-backed-AI-API-keys.patch``
+- ``0003-support-quiet-AI-change-filtering.patch``
+- ``0004-add-compact-HTML-change-digests.patch``
+- ``0005-suppress-AI-failures-from-change-reports.patch``
+- ``0006-add-OpenAI-email-integration-coverage.patch``
+- ``0007-show-actionable-fetch-errors-after-digest-content.patch``
+- ``0008-support-streamed-newsletter-summaries-reject-silent-.patch``
+- ``0009-accept-explicit-stop-completion-in-model-streams.patch``
+- ``0010-forward-reasoning-effort-to-OpenAI-compatible-models.patch``
+
 .. role:: underline
     :class: underline
 .. role:: additions
