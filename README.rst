@@ -1,3 +1,23 @@
+This fork follows upstream `webchanges <https://github.com/mborsetti/webchanges>`__ and applies patches below in order. ``automation`` owns patches and workflows; generated ``main`` contains upstream source plus these patches. Nightly builds follow upstream default branch; stable builds follow upstream releases.
+
+Patched webchanges
+==================
+
+Applied patches, oldest first:
+
+1. `0001-add-OpenAI-compatible-AI-differ.patch <https://github.com/felixfoertsch/webchanges/blob/automation/patches/0001-add-OpenAI-compatible-AI-differ.patch>`__
+2. `0002-support-file-backed-AI-API-keys.patch <https://github.com/felixfoertsch/webchanges/blob/automation/patches/0002-support-file-backed-AI-API-keys.patch>`__
+3. `0003-support-quiet-AI-change-filtering.patch <https://github.com/felixfoertsch/webchanges/blob/automation/patches/0003-support-quiet-AI-change-filtering.patch>`__
+4. `0004-add-compact-HTML-change-digests.patch <https://github.com/felixfoertsch/webchanges/blob/automation/patches/0004-add-compact-HTML-change-digests.patch>`__
+5. `0005-suppress-AI-failures-from-change-reports.patch <https://github.com/felixfoertsch/webchanges/blob/automation/patches/0005-suppress-AI-failures-from-change-reports.patch>`__
+6. `0006-add-OpenAI-email-integration-coverage.patch <https://github.com/felixfoertsch/webchanges/blob/automation/patches/0006-add-OpenAI-email-integration-coverage.patch>`__
+7. `0007-show-actionable-fetch-errors-after-digest-content.patch <https://github.com/felixfoertsch/webchanges/blob/automation/patches/0007-show-actionable-fetch-errors-after-digest-content.patch>`__
+8. `0008-support-streamed-newsletter-summaries-reject-silent-.patch <https://github.com/felixfoertsch/webchanges/blob/automation/patches/0008-support-streamed-newsletter-summaries-reject-silent-.patch>`__
+9. `0009-accept-explicit-stop-completion-in-model-streams.patch <https://github.com/felixfoertsch/webchanges/blob/automation/patches/0009-accept-explicit-stop-completion-in-model-streams.patch>`__
+10. `0010-forward-reasoning-effort-to-OpenAI-compatible-models.patch <https://github.com/felixfoertsch/webchanges/blob/automation/patches/0010-forward-reasoning-effort-to-OpenAI-compatible-models.patch>`__
+
+----
+
 .. role:: underline
     :class: underline
 .. role:: additions
