@@ -17,6 +17,7 @@ report:
     footer: true
     separate: false
     title: '[webchanges] {count} changes{jobs_files}: {jobs}'
+    compact: false
   markdown:
     details: true
     footer: true

@@ -76,7 +76,8 @@ Any report- or reporter-specific configuration must be inside the ``report`` dir
 
 ``text``, ``html`` and ``markdown`` are report types, and their settings apply to all reporters that use that type of
 report (for example, the ``stdout`` reporter uses ``text``, while the ``email`` reporter with ``html: true`` uses
-``html``; see :ref:`reporters <reporters>` for details).
+``html``; see :ref:`reporters <reporters>` for details). Set ``report.html.compact: true`` for compact,
+mobile-friendly HTML email cards.
 
 Here is an example configuration that reports using UTC timezone on standard output in color, as well as HTML email
 (one report for each job) using an SMTP server:

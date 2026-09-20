@@ -1329,6 +1329,25 @@ def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pyte
     assert request_data[1]['messages'][0] == {'role': 'system', 'content': 'Be terse.'}
 
 
+def test_ai_openai_summary_only(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={'choices': [{'message': {'content': 'Changed.'}}]}, request=request)
+
+    client = httpx.Client
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+    monkeypatch.setattr(
+        differs.httpx,
+        'Client',
+        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    job_state.old_data = 'old\n'
+    job_state.new_data = 'new\n'
+    job_state.job.differ = {'name': 'ai_openai', 'summary_only': True}
+
+    assert job_state.get_diff() == 'Changed.'
+    assert job_state.get_diff('html') == 'Changed.'
+
+
 def test_ai_openai_reads_api_key_file(monkeypatch: pytest.MonkeyPatch, job_state: JobState, tmp_path: Path) -> None:
     key_file = tmp_path / 'api-key'
     key_file.write_text('file-key\n')

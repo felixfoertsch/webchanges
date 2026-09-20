@@ -39,6 +39,7 @@ class _ConfigReportHtml(TypedDict):
     footer: bool
     separate: bool
     title: str
+    compact: bool
 
 
 class _ConfigReportMarkdown(TypedDict):
@@ -309,6 +310,7 @@ DEFAULT_CONFIG: _Config = {
             'footer': True,
             'separate': False,
             'title': f'[{__project_name__}] {{count}} changes{{jobs_files}}: {{jobs}}',
+            'compact': False,
         },
         'markdown': {
             'details': True,  # whether the diff is sent

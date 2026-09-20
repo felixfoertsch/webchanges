@@ -120,6 +120,7 @@ AiOpenAIDirectives = TypedDict(
         'additions_only': str,
         'prompt_ud_context_lines': int,
         'no_report_if': str,
+        'summary_only': bool,
         'unified': dict[str, Any],
     },
     total=False,
@@ -2247,6 +2248,12 @@ class AIGoogleDiffer(DifferBase):
             if model_version or directives_text
             else ''
         )
+        if self.__kind__ == 'ai_openai' and directives.get('summary_only'):
+            return {
+                'plain': summary,
+                'markdown': summary,
+                'html': mark_to_html(summary, extras={'tables'}).replace('<h2>', '<h3>').replace('</h2>', '</h3>'),
+            }
         temp_unfiltered_diff: dict[ReportKind, str] = {}
         for rep_kind in ('plain', 'html'):  # markdown is same as text
             unified_report = DifferBase.process(
@@ -2293,6 +2300,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
         'temperature': "model's Temperature parameter (default: 0.0)",
         'top_p': "model's TopP parameter (default: 1.0 when temperature is 0.0)",
         'no_report_if': 'suppress report when model output exactly matches this string',
+        'summary_only': 'show only AI summary; omit unified diff and AI footer (default: false)',
         'unified': 'directives passed to unified differ (default: None)',
     }
     __default_directive__ = 'model'
