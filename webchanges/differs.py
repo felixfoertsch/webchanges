@@ -119,6 +119,7 @@ AiOpenAIDirectives = TypedDict(
         'prompt': str,
         'additions_only': str,
         'prompt_ud_context_lines': int,
+        'no_report_if': str,
         'unified': dict[str, Any],
     },
     total=False,
@@ -2291,6 +2292,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
         'max_output_tokens': "maximum tokens returned by model (default: model's default)",
         'temperature': "model's Temperature parameter (default: 0.0)",
         'top_p': "model's TopP parameter (default: 1.0 when temperature is 0.0)",
+        'no_report_if': 'suppress report when model output exactly matches this string',
         'unified': 'directives passed to unified differ (default: None)',
     }
     __default_directive__ = 'model'
@@ -2362,6 +2364,20 @@ class AIOpenAIDiffer(AIGoogleDiffer):
             )
 
         return summary, ''
+
+    def differ(
+        self,
+        directives: AiOpenAIDirectives,
+        report_kind: ReportKind,
+        _unfiltered_diff: dict[ReportKind, str] | None = None,
+        tz: tzinfo | None = None,
+    ) -> dict[ReportKind, str]:
+        result = super().differ(directives, report_kind, _unfiltered_diff, tz)
+        marker = directives.get('no_report_if')
+        if marker and any(value.split('\n', 1)[0].strip() == marker for value in result.values()):
+            self.state.verb = 'changed,no_report'
+            return {'plain': '', 'markdown': '', 'html': ''}
+        return result
 
 
 class WdiffDiffer(DifferBase):
