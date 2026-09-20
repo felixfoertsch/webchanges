@@ -199,6 +199,7 @@ config file. The following example will set the default model name to ``gemini-2
      unified: {}
      ai_google:
        model: gemini-2.0-flash
+     ai_openai: {}
      command: {}
      deepdiff: {}
      image: {}
