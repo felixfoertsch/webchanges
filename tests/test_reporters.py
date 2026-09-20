@@ -19,6 +19,7 @@ except ImportError:
 from webchanges.handler import JobState, Report
 from webchanges.jobs import JobBase
 from webchanges.mailer import SMTPMailer, smtp_have_password, smtp_set_password
+from webchanges.reporters import HtmlReporter
 from webchanges.storage import DEFAULT_CONFIG
 
 try:
@@ -133,6 +134,18 @@ def build_test_report() -> Report:
     )
 
     return test_report
+
+
+def test_compact_html_report() -> None:
+    test_report = build_test_report()
+    test_report.config['report']['html']['compact'] = True
+    html = '\n'.join(HtmlReporter(test_report, {}, test_report.job_states, 1, [], {}).submit())
+
+    assert '<div style="max-width:600px;margin:0 auto;padding:16px;">' in html
+    card_style = 'style="margin:0 0 16px;padding:16px;background:#ffffff;border:1px solid #d0d7de;border-radius:6px;"'
+    assert html.count(card_style) == 3
+    assert '<a href="https://example.com/changed"' in html
+    assert 'Something Changed</a>' in html
 
 
 @pytest.mark.filterwarnings('ignore::getpass.GetPassWarning')  # headless runs cannot control terminal echo
