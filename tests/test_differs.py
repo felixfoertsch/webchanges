@@ -1329,8 +1329,12 @@ def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pyte
     assert request_data[1]['messages'][0] == {'role': 'system', 'content': 'Be terse.'}
 
 
-def test_ai_openai_summary_only(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
+@pytest.mark.parametrize('stream', [False, True])
+def test_ai_openai_summary_only(monkeypatch: pytest.MonkeyPatch, job_state: JobState, stream: bool) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if stream:
+            assert json.loads(request.content)['stream'] is True
+            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"Changed."}}]}\n\ndata: [DONE]\n', request=request)
         return httpx.Response(200, json={'choices': [{'message': {'content': 'Changed.'}}]}, request=request)
 
     client = httpx.Client
@@ -1342,7 +1346,7 @@ def test_ai_openai_summary_only(monkeypatch: pytest.MonkeyPatch, job_state: JobS
     )
     job_state.old_data = 'old\n'
     job_state.new_data = 'new\n'
-    job_state.job.differ = {'name': 'ai_openai', 'summary_only': True}
+    job_state.job.differ = {'name': 'ai_openai', 'summary_only': True, 'stream': stream}
 
     assert job_state.get_diff() == 'Changed.'
     assert job_state.get_diff('html') == 'Changed.'

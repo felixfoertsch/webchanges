@@ -2301,6 +2301,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
         'temperature': "model's Temperature parameter (default: 0.0)",
         'top_p': "model's TopP parameter (default: 1.0 when temperature is 0.0)",
         'no_report_if': 'suppress report when model output exactly matches this string',
+        'stream': 'request streamed model output (default: false)',
         'no_report_on_error': 'suppress report when every model request fails (default: false)',
         'summary_only': 'show only AI summary; omit unified diff and AI footer (default: false)',
         'unified': 'directives passed to unified differ (default: None)',
@@ -2340,6 +2341,8 @@ class AIOpenAIDiffer(AIGoogleDiffer):
         }
         if directives.get('max_output_tokens') is not None:
             data['max_tokens'] = directives['max_output_tokens']
+        if directives.get('stream'):
+            data['stream'] = True
 
         for model in models:
             data['model'] = model
@@ -2361,9 +2364,24 @@ class AIOpenAIDiffer(AIGoogleDiffer):
 
             if response.is_success:
                 try:
-                    result = json.loads(re.split(r'\s*data: \[DONE\]\s*$', response.text, maxsplit=1)[0])
-                    summary = result['choices'][0]['message']['content'].rstrip()
-                except (json.JSONDecodeError, KeyError, IndexError, AttributeError, TypeError):
+                    if directives.get('stream') and response.text.startswith('data:'):
+                        chunks = []
+                        done = False
+                        for line in response.text.splitlines():
+                            if line == 'data: [DONE]':
+                                done = True
+                            elif line.startswith('data: '):
+                                event = json.loads(line[6:])
+                                chunks.extend(c.get('delta', {}).get('content') or '' for c in event['choices'])
+                        if not done:
+                            raise ValueError('Incomplete model stream')
+                        summary = ''.join(chunks).strip()
+                    else:
+                        result = json.loads(re.split(r'\s*data: \[DONE\]\s*$', response.text, maxsplit=1)[0])
+                        summary = result['choices'][0]['message']['content'].strip()
+                    if not summary:
+                        raise ValueError('Empty model response')
+                except (ValueError, KeyError, IndexError, AttributeError, TypeError):
                     summary = '## ERROR in summarizing changes using OpenAI-compatible AI:\nModel did not return any candidate output.'
                     continue
                 return summary, model
