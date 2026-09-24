@@ -2372,6 +2372,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
                                 done = True
                             elif line.startswith('data: '):
                                 event = json.loads(line[6:])
+                                done = done or any(c.get('finish_reason') == 'stop' for c in event['choices'])
                                 chunks.extend(c.get('delta', {}).get('content') or '' for c in event['choices'])
                         if not done:
                             raise ValueError('Incomplete model stream')
