@@ -1334,7 +1334,7 @@ def test_ai_openai_summary_only(monkeypatch: pytest.MonkeyPatch, job_state: JobS
     def handler(request: httpx.Request) -> httpx.Response:
         if stream:
             assert json.loads(request.content)['stream'] is True
-            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"Changed."}}]}\n\ndata: [DONE]\n', request=request)
+            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"Changed."}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n', request=request)
         return httpx.Response(200, json={'choices': [{'message': {'content': 'Changed.'}}]}, request=request)
 
     client = httpx.Client
