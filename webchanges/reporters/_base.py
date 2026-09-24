@@ -374,6 +374,7 @@ class HtmlReporter(ReporterBase):
 
     def _compact_parts(self, job_states: list[JobState], cfg: dict[str, Any], title: str) -> Iterable[str]:
         """Yield compact, email-safe HTML cards."""
+        errors = [state for state in job_states if state.verb in ('error', 'error,repeated')]
         yield (
             '<!DOCTYPE html><html><head>'
             f'<title>{html.escape(title)}</title>'
@@ -383,6 +384,8 @@ class HtmlReporter(ReporterBase):
             '<div style="max-width:600px;margin:0 auto;padding:16px;">'
         )
         for job_state in job_states:
+            if job_state.verb in ('error', 'error,repeated'):
+                continue
             differ = job_state.job.differ or {'name': cfg['diff']}
             content = self._format_content(job_state, differ)
             if content is None or job_state.verb == 'changed,no_report':
@@ -396,6 +399,23 @@ class HtmlReporter(ReporterBase):
                 yield f'<div style="margin:0 0 12px;color:#57606a;">{self.markdown_to_html(job_state.job.note)}</div>'
             yield f'<div style="font-size:14px;line-height:1.5;overflow-wrap:anywhere;">{content}</div>'
             yield '</div>'
+        if errors:
+            yield f'<h2 style="font-size:18px;">Errors ({len(errors)})</h2>'
+            yield '<p>These sources could not be checked. They will be retried on the next scheduled run.</p><ul>'
+            for state in errors:
+                location = html.escape(state.job.get_location())
+                name = html.escape(state.job.pretty_name())
+                error_type = state.new_error_data.get('type') or type(state.exception).__name__
+                message = state.new_error_data.get('message') or state.traceback
+                advice = 'Open the source URL and check the job configuration; inspect the log for full details.'
+                if 'timeout' in error_type.lower():
+                    advice = 'Check whether the source loads; if timeouts persist, review the job timeout setting.'
+                yield (
+                    f'<li style="margin-bottom:16px;overflow-wrap:anywhere;"><a href="{location}">{name}</a>'
+                    f'<br><code>{location}</code><br><strong>{html.escape(error_type)}</strong>: '
+                    f'{html.escape(message)}<br>Consecutive failures: {state.tries}<br>{advice}</li>'
+                )
+            yield '</ul>'
         yield '</div></body></html>'
 
     @staticmethod
