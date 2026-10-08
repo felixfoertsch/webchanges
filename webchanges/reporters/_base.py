@@ -301,6 +301,9 @@ class HtmlReporter(ReporterBase):
         if not filtered_job_states:
             return
         title = self.subject_with_args(filtered_job_states, self.report.config['report']['html']['title'])
+        if self.report.config['report']['html']['compact']:
+            yield from self._compact_parts(filtered_job_states, cfg, title)
+            return
 
         yield (
             '<!DOCTYPE html>\n'
@@ -368,6 +371,32 @@ class HtmlReporter(ReporterBase):
                     f'updating.</b>'
                 )
         yield '</span>\n</body>\n</html>\n'
+
+    def _compact_parts(self, job_states: list[JobState], cfg: dict[str, Any], title: str) -> Iterable[str]:
+        """Yield compact, email-safe HTML cards."""
+        yield (
+            '<!DOCTYPE html><html><head>'
+            f'<title>{html.escape(title)}</title>'
+            '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+            '</head><body style="margin:0;background:#f6f8fa;font-family:Arial,Helvetica,sans-serif;color:#24292f;">'
+            '<div style="max-width:600px;margin:0 auto;padding:16px;">'
+        )
+        for job_state in job_states:
+            differ = job_state.job.differ or {'name': cfg['diff']}
+            content = self._format_content(job_state, differ)
+            if content is None or job_state.verb == 'changed,no_report':
+                continue
+            location = html.escape(job_state.job.get_location())
+            name = html.escape(job_state.job.pretty_name())
+            source = f'<a href="{location}" style="color:#0969da;text-decoration:none;">{name}</a>'
+            yield '<div style="margin:0 0 16px;padding:16px;background:#ffffff;border:1px solid #d0d7de;border-radius:6px;">'
+            yield f'<div style="margin:0 0 12px;font-size:18px;font-weight:bold;">{source}</div>'
+            if hasattr(job_state.job, 'note') and job_state.job.note:
+                yield f'<div style="margin:0 0 12px;color:#57606a;">{self.markdown_to_html(job_state.job.note)}</div>'
+            yield f'<div style="font-size:14px;line-height:1.5;overflow-wrap:anywhere;">{content}</div>'
+            yield '</div>'
+        yield '</div></body></html>'
 
     @staticmethod
     def markdown_to_html(text: str, markdown_padded_tables: bool | None = None) -> str:

@@ -188,7 +188,8 @@ set ``api_key_env`` to use another environment variable.
 
 ``model`` selects one model. ``models`` supplies fallback models tried sequentially when ``model`` is absent.
 ``timeout``, ``max_output_tokens``, ``temperature``, ``top_p``, ``system_instructions``, ``prompt``, ``additions_only``,
-``prompt_ud_context_lines``, and ``unified`` behave like :ref:`ai_google <ai_google_diff>`.
+``prompt_ud_context_lines``, and ``unified`` behave like :ref:`ai_google <ai_google_diff>`. Set ``summary_only: true``
+to omit unified diff and AI model/directive footer from all report formats.
 
 Example:
 
