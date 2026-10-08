@@ -120,6 +120,7 @@ AiOpenAIDirectives = TypedDict(
         'additions_only': str,
         'prompt_ud_context_lines': int,
         'no_report_if': str,
+        'no_report_on_error': bool,
         'summary_only': bool,
         'unified': dict[str, Any],
     },
@@ -2300,6 +2301,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
         'temperature': "model's Temperature parameter (default: 0.0)",
         'top_p': "model's TopP parameter (default: 1.0 when temperature is 0.0)",
         'no_report_if': 'suppress report when model output exactly matches this string',
+        'no_report_on_error': 'suppress report when every model request fails (default: false)',
         'summary_only': 'show only AI summary; omit unified diff and AI footer (default: false)',
         'unified': 'directives passed to unified differ (default: None)',
     }
@@ -2382,7 +2384,10 @@ class AIOpenAIDiffer(AIGoogleDiffer):
     ) -> dict[ReportKind, str]:
         result = super().differ(directives, report_kind, _unfiltered_diff, tz)
         marker = directives.get('no_report_if')
-        if marker and any(value.split('\n', 1)[0].strip() == marker for value in result.values()):
+        suppress_error = directives.get('no_report_on_error') and any(
+            value.lstrip().startswith('## ERROR in summarizing changes') for value in result.values()
+        )
+        if suppress_error or marker and any(value.split('\n', 1)[0].strip() == marker for value in result.values()):
             self.state.verb = 'changed,no_report'
             return {'plain': '', 'markdown': '', 'html': ''}
         return result
