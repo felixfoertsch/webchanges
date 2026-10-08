@@ -2298,6 +2298,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
         'prompt_ud_context_lines': 'number of context lines for {unified_diff} (default: 9999)',
         'timeout': 'number of seconds before timing out API call (default: 300)',
         'max_output_tokens': "maximum tokens returned by model (default: model's default)",
+        'reasoning_effort': "model's reasoning effort (default: model's default)",
         'temperature': "model's Temperature parameter (default: 0.0)",
         'top_p': "model's TopP parameter (default: 1.0 when temperature is 0.0)",
         'no_report_if': 'suppress report when model output exactly matches this string',
@@ -2341,6 +2342,8 @@ class AIOpenAIDiffer(AIGoogleDiffer):
         }
         if directives.get('max_output_tokens') is not None:
             data['max_tokens'] = directives['max_output_tokens']
+        if directives.get('reasoning_effort') is not None:
+            data['reasoning_effort'] = directives['reasoning_effort']
         if directives.get('stream'):
             data['stream'] = True
 
