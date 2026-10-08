@@ -241,6 +241,7 @@ class _ConfigDifferDefaults(TypedDict, total=False):
     _note: str
     unified: dict[str, Any]
     ai_google: dict[str, Any]
+    ai_openai: dict[str, Any]
     command: dict[str, Any]
     deepdiff: dict[str, Any]
     image: dict[str, Any]
@@ -457,6 +458,7 @@ DEFAULT_CONFIG: _Config = {
         '_note': 'Default directives that are applied to individual differs.',
         'unified': {},
         'ai_google': {},
+        'ai_openai': {},
         'command': {},
         'deepdiff': {},
         'image': {},

@@ -31,6 +31,7 @@ At the moment, the following differs are available:
 In addition, the following BETA differs are available:
 
   - :ref:`ai_google <ai_google_diff>`: Detects and summarizes changes using Generative AI (free API key required);
+  - :ref:`ai_openai <ai_openai_diff>`: Detects and summarizes changes using an OpenAI-compatible API;
   - :ref:`image <image_diff>`: Detects changes in an image and displays them as overlay over a grayscale version of the
     old image.
 
@@ -175,6 +176,28 @@ Optional directives
 .. versionchanged:: 3.21
    Became a standalone differ. Added the ``range_info`` and ``context_line`` directives, the latter replacing the
    job directive ``contextlines`` (added in version 3.0).
+
+
+.. _ai_openai_diff:
+
+``ai_openai``
+-------------
+Uses an OpenAI-compatible ``/v1/chat/completions`` endpoint to summarize changes. Defaults to
+``http://127.0.0.1:20128/v1/chat/completions``, suitable for 9router. It uses ``OPENAI_API_KEY`` by default;
+set ``api_key_env`` to use another environment variable.
+
+``model`` selects one model. ``models`` supplies fallback models tried sequentially when ``model`` is absent.
+``timeout``, ``max_output_tokens``, ``temperature``, ``top_p``, ``system_instructions``, ``prompt``, ``additions_only``,
+``prompt_ud_context_lines``, and ``unified`` behave like :ref:`ai_google <ai_google_diff>`.
+
+Example:
+
+.. code-block:: yaml
+
+   differ:
+     name: ai_openai
+     api_url: http://127.0.0.1:20128/v1/chat/completions
+     models: [gpt-4o-mini, gpt-4.1-mini]
 
 
 .. _ai_google_diff:

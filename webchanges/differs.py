@@ -103,6 +103,26 @@ AiGoogleDirectives = TypedDict(
     total=False,
 )
 
+AiOpenAIDirectives = TypedDict(
+    'AiOpenAIDirectives',
+    {
+        'api_url': str,
+        'api_key_env': str,
+        'model': str,
+        'models': list[str],
+        'timeout': int,
+        'max_output_tokens': int | None,
+        'temperature': float | None,
+        'top_p': float | None,
+        'system_instructions': str,
+        'prompt': str,
+        'additions_only': str,
+        'prompt_ud_context_lines': int,
+        'unified': dict[str, Any],
+    },
+    total=False,
+)
+
 ReportKind = Literal['plain', 'markdown', 'html']
 
 # Retry policy for transient Google Generative AI (Gemini) API responses (429 rate-limit, 503 unavailable).
@@ -1872,6 +1892,7 @@ class AIGoogleDiffer(DifferBase):
     """
 
     __kind__ = 'ai_google'
+    __summary_name__ = 'Google Generative AI'
 
     __supported_directives__: dict[str, str] = {
         'model': ('model name from https://ai.google.dev/gemini-api/docs/models/gemini (default: gemini-2.0-flash)'),
@@ -2046,30 +2067,20 @@ class AIGoogleDiffer(DifferBase):
 
         def get_ai_summary(prompt: str, system_instructions: str) -> tuple[str, str]:
             """Generate AI summary from unified diff, or an error message, plus the model version."""
-            # GOOGLE_AI_API_KEY deprecated end of 2025
-            gemini_api_key = os.environ.get('GEMINI_API_KEY', '').rstrip()
-            if not gemini_api_key:
-                gemini_api_key = os.environ.get('GOOGLE_AI_API_KEY', '').rstrip()
-                if gemini_api_key:
-                    warnings.warn(
-                        'The environment variable GOOGLE_AI_API_KEY is deprecated; please use GEMINI_API_KEY instead.',
-                        DeprecationWarning,
-                        stacklevel=1,
+            if self.__kind__ == 'ai_google':
+                gemini_api_key = os.environ.get('GEMINI_API_KEY', '').rstrip()
+                if not gemini_api_key:
+                    gemini_api_key = os.environ.get('GOOGLE_AI_API_KEY', '').rstrip()
+                if len(gemini_api_key) != 39:
+                    logger.error(
+                        f'Job {self.job.index_number}: Environment variable GEMINI_API_KEY not found or is of the '
+                        f'incorrect length {len(gemini_api_key)} ({self.job.get_location()})'
                     )
-            if len(gemini_api_key) != 39:
-                logger.error(
-                    f'Job {self.job.index_number}: Environment variable GEMINI_API_KEY not found or is of the '
-                    f'incorrect length {len(gemini_api_key)} ({self.job.get_location()})'
-                )
-                return (
-                    (
-                        f'## ERROR in summarizing changes using Google AI:\n'
-                        f'Environment variable GEMINI_API_KEY not found or is of the incorrect length '
-                        f'{len(gemini_api_key)}.\n'
-                    ),
-                    '',
-                )
-
+                    return (
+                        f'## ERROR in summarizing changes using Google AI:\nEnvironment variable GEMINI_API_KEY '
+                        f'not found or is of the incorrect length {len(gemini_api_key)}.\n',
+                        '',
+                    )
             if '{unified_diff' in prompt:  # matches unified_diff or unified_diff_new
                 default_context_lines = 9999 if '{unified_diff}' in prompt else 0  # none if only unified_diff_new
                 context_lines = directives.get('prompt_ud_context_lines', default_context_lines)
@@ -2230,7 +2241,7 @@ class AIGoogleDiffer(DifferBase):
             else ''
         )
         footer = (
-            f"Summary by Google Generative AI's model {model_version}{directives_text}."
+            f"Summary by {self.__summary_name__}'s model {model_version}{directives_text}."
             if model_version or directives_text
             else ''
         )
@@ -2257,6 +2268,94 @@ class AIGoogleDiffer(DifferBase):
                 + (['-----<br>', f'<i><small>{footer}</small></i>'] if footer else [])
             ),
         }
+
+
+class AIOpenAIDiffer(AIGoogleDiffer):
+    """Generates a summary using an OpenAI-compatible chat-completions API."""
+
+    __kind__ = 'ai_openai'
+    __summary_name__ = 'OpenAI-compatible AI'
+
+    __supported_directives__: dict[str, str] = {
+        'api_url': 'chat completions API URL (default: http://127.0.0.1:20128/v1/chat/completions)',
+        'api_key_env': 'environment variable containing API key (default: OPENAI_API_KEY)',
+        'model': 'model name (default: gpt-4o-mini)',
+        'models': 'model names to try sequentially when model is not set',
+        'system_instructions': 'optional tone and style instructions for model',
+        'prompt': 'custom prompt - {unified_diff}, {unified_diff_new}, {old_text} and {new_text} will be replaced',
+        'additions_only': 'summarizes only added lines (including as a result of a change)',
+        'prompt_ud_context_lines': 'number of context lines for {unified_diff} (default: 9999)',
+        'timeout': 'number of seconds before timing out API call (default: 300)',
+        'max_output_tokens': "maximum tokens returned by model (default: model's default)",
+        'temperature': "model's Temperature parameter (default: 0.0)",
+        'top_p': "model's TopP parameter (default: 1.0 when temperature is 0.0)",
+        'unified': 'directives passed to unified differ (default: None)',
+    }
+    __default_directive__ = 'model'
+
+    @staticmethod
+    def _send_to_model(
+        job: JobBase,
+        system_instructions: str,
+        model_prompt: str,
+        additional_parts: list[dict[str, str | dict[str, str]]] | None = None,
+        directives: AiOpenAIDirectives | None = None,
+    ) -> tuple[str, str]:
+        if directives is None:
+            directives = {}
+        api_key_env = directives.get('api_key_env', 'OPENAI_API_KEY')
+        api_key = os.environ.get(api_key_env, '').rstrip()
+        if not api_key:
+            logger.error(f'Job {job.index_number}: Environment variable {api_key_env} not found ({job.get_location()})')
+            return f'## ERROR in summarizing changes using OpenAI-compatible AI:\nEnvironment variable {api_key_env} not found.', ''
+
+        models = [directives['model']] if directives.get('model') else directives.get('models', ['gpt-4o-mini'])
+        if not models:
+            return '## ERROR in summarizing changes using OpenAI-compatible AI:\nNo model configured.', ''
+        api_url = directives.get('api_url', 'http://127.0.0.1:20128/v1/chat/completions')
+        timeout = directives.get('timeout', 300)
+        data: dict[str, Any] = {
+            'messages': ([{'role': 'system', 'content': system_instructions}] if system_instructions else [])
+            + [{'role': 'user', 'content': model_prompt}],
+            'temperature': directives.get('temperature', 0.0),
+            'top_p': directives.get('top_p', 1.0 if directives.get('temperature', 0.0) == 0.0 else None),
+        }
+        if directives.get('max_output_tokens') is not None:
+            data['max_tokens'] = directives['max_output_tokens']
+
+        for model in models:
+            data['model'] = model
+            logger.info(f'Job {job.index_number}: Making content generation request to OpenAI-compatible model {model}')
+            try:
+                with httpx.Client(http2=h2 is not None) as http_client:
+                    response = http_client.post(
+                        api_url,
+                        json=data,
+                        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+                        timeout=timeout,
+                    )
+            except httpx.HTTPError as e:
+                summary = (
+                    f'## ERROR in summarizing changes using OpenAI-compatible AI:\n'
+                    f'HTTP client error: {e} when requesting data from {e.request.url.host}'
+                )
+                continue
+
+            if response.is_success:
+                try:
+                    result = json.loads(re.split(r'\s*data: \[DONE\]\s*$', response.text, maxsplit=1)[0])
+                    summary = result['choices'][0]['message']['content'].rstrip()
+                except (json.JSONDecodeError, KeyError, IndexError, AttributeError, TypeError):
+                    summary = '## ERROR in summarizing changes using OpenAI-compatible AI:\nModel did not return any candidate output.'
+                    continue
+                return summary, model
+
+            summary = (
+                f'## ERROR in summarizing changes using OpenAI-compatible AI:\nReceived error {response.status_code} '
+                f'{response.reason_phrase} from {response.url.host}'
+            )
+
+        return summary, ''
 
 
 class WdiffDiffer(DifferBase):

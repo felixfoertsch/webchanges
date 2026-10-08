@@ -8,6 +8,7 @@ Run individually with
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import random
@@ -1281,6 +1282,62 @@ def test_ai_google_timeout_no_unified_diff(job_state: JobState, caplog: pytest.L
         if existing_key:
             os.environ['GEMINI_API_KEY'] = existing_key
         logging.getLogger('webchanges.differs').setLevel(level=logging.WARNING)
+
+
+def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if json.loads(request.content)['model'] == 'bad':
+            return httpx.Response(404, request=request)
+        return httpx.Response(
+            200,
+            text='{"choices":[{"message":{"content":"Changed."}}]}\ndata: [DONE]',
+            request=request,
+        )
+
+    client = httpx.Client
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+    monkeypatch.setattr(
+        differs.httpx,
+        'Client',
+        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    job_state.old_data = 'old\n'
+    job_state.new_data = 'new\n'
+    job_state.job.differ = {
+        'name': 'ai_openai',
+        'api_url': 'https://example.test/v1/chat/completions',
+        'models': ['bad', 'good'],
+        'max_output_tokens': 42,
+        'temperature': 0.2,
+        'top_p': 0.8,
+        'system_instructions': 'Be terse.',
+    }
+
+    diff = job_state.get_diff()
+
+    assert diff.startswith('Changed.')
+    assert "Summary by OpenAI-compatible AI's model good" in diff
+    request_data = [json.loads(request.content) for request in requests]
+    assert [data['model'] for data in request_data] == ['bad', 'good']
+    assert requests[1].headers['authorization'] == 'Bearer test-key'
+    assert request_data[1]['max_tokens'] == 42
+    assert request_data[1]['temperature'] == 0.2
+    assert request_data[1]['top_p'] == 0.8
+    assert request_data[1]['messages'][0] == {'role': 'system', 'content': 'Be terse.'}
+
+
+def test_ai_openai_requires_api_key(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+    job_state.old_data = 'old\n'
+    job_state.new_data = 'new\n'
+    job_state.job.differ = {'name': 'ai_openai'}
+
+    diff = job_state.get_diff()
+
+    assert diff.startswith('## ERROR in summarizing changes using OpenAI-compatible AI:\nEnvironment variable OPENAI_API_KEY')
 
 
 WDIFF_TEST_DATA = [
