@@ -1,0 +1,151 @@
+From 3ec025266dd5540d6578498f5e7133017679e264 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Felix=20F=C3=B6rtsch?= <mail@felixfoertsch.de>
+Date: Thu, 8 Oct 2026 09:36:54 +0200
+Subject: [PATCH] handle streamed newsletter summaries, reject silent failures
+
+---
+ tests/test_differs.py             |  8 ++++++--
+ tests/test_newsletter_failures.py | 28 ++++++++++++++++++++++++++++
+ webchanges/differs.py             | 25 ++++++++++++++++++++++---
+ webchanges/filters/_text.py       | 13 +++++++++++++
+ 4 files changed, 69 insertions(+), 5 deletions(-)
+ create mode 100644 tests/test_newsletter_failures.py
+
+diff --git a/tests/test_differs.py b/tests/test_differs.py
+index 1391dc8..3caeb35 100644
+--- a/tests/test_differs.py
++++ b/tests/test_differs.py
+@@ -1329,8 +1329,12 @@ def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pyte
+     assert request_data[1]['messages'][0] == {'role': 'system', 'content': 'Be terse.'}
+ 
+ 
+-def test_ai_openai_summary_only(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
++@pytest.mark.parametrize('stream', [False, True])
++def test_ai_openai_summary_only(monkeypatch: pytest.MonkeyPatch, job_state: JobState, stream: bool) -> None:
+     def handler(request: httpx.Request) -> httpx.Response:
++        if stream:
++            assert json.loads(request.content)['stream'] is True
++            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"Changed."}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n', request=request)
+         return httpx.Response(200, json={'choices': [{'message': {'content': 'Changed.'}}]}, request=request)
+ 
+     client = httpx.Client
+@@ -1342,7 +1346,7 @@ def test_ai_openai_summary_only(monkeypatch: pytest.MonkeyPatch, job_state: JobS
+     )
+     job_state.old_data = 'old\n'
+     job_state.new_data = 'new\n'
+-    job_state.job.differ = {'name': 'ai_openai', 'summary_only': True}
++    job_state.job.differ = {'name': 'ai_openai', 'summary_only': True, 'stream': stream}
+ 
+     assert job_state.get_diff() == 'Changed.'
+     assert job_state.get_diff('html') == 'Changed.'
+diff --git a/tests/test_newsletter_failures.py b/tests/test_newsletter_failures.py
+new file mode 100644
+index 0000000..88846f8
+--- /dev/null
++++ b/tests/test_newsletter_failures.py
+@@ -0,0 +1,28 @@
++"""Failures must not masquerade as uninteresting content."""
++import pytest
++import httpx
++
++from webchanges.differs import AIOpenAIDiffer
++from webchanges.filters._text import RejectTextFilter
++from webchanges.jobs import JobBase
++
++
++def test_block_page_is_rejected():
++    job = JobBase.unserialize({'url': 'https://example.test'})
++    from webchanges.handler import JobState
++    f = RejectTextFilter(JobState(None, job))
++    rule = {'pattern': 'Javascript is required.*enable javascript'}
++    with pytest.raises(ValueError, match='access-block'):
++        f.filter('Javascript is required. Please enable javascript', 'text/plain', rule)
++    assert f.filter('New issue available', 'text/plain', rule)[0] == 'New issue available'
++
++
++@pytest.mark.parametrize('body', ['', '   '])
++def test_empty_model_output_is_error(monkeypatch, body):
++    client = httpx.Client
++    monkeypatch.setenv('OPENAI_API_KEY', 'test')
++    monkeypatch.setattr(httpx, 'Client', lambda **kw: client(transport=httpx.MockTransport(
++        lambda request: httpx.Response(200, json={'choices': [{'message': {'content': body}}]}, request=request)), **kw))
++    job = JobBase.unserialize({'url': 'https://example.test'})
++    summary, _ = AIOpenAIDiffer._send_to_model(job, '', 'Summarise changes')
++    assert summary.startswith('## ERROR')
+diff --git a/webchanges/differs.py b/webchanges/differs.py
+index 91b981e..5991d8f 100644
+--- a/webchanges/differs.py
++++ b/webchanges/differs.py
+@@ -2301,6 +2301,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
+         'temperature': "model's Temperature parameter (default: 0.0)",
+         'top_p': "model's TopP parameter (default: 1.0 when temperature is 0.0)",
+         'no_report_if': 'suppress report when model output exactly matches this string',
++        'stream': 'request streamed model output (default: false)',
+         'no_report_on_error': 'suppress report when every model request fails (default: false)',
+         'summary_only': 'show only AI summary; omit unified diff and AI footer (default: false)',
+         'unified': 'directives passed to unified differ (default: None)',
+@@ -2340,6 +2341,8 @@ class AIOpenAIDiffer(AIGoogleDiffer):
+         }
+         if directives.get('max_output_tokens') is not None:
+             data['max_tokens'] = directives['max_output_tokens']
++        if directives.get('stream'):
++            data['stream'] = True
+ 
+         for model in models:
+             data['model'] = model
+@@ -2361,9 +2364,25 @@ class AIOpenAIDiffer(AIGoogleDiffer):
+ 
+             if response.is_success:
+                 try:
+-                    result = json.loads(re.split(r'\s*data: \[DONE\]\s*$', response.text, maxsplit=1)[0])
+-                    summary = result['choices'][0]['message']['content'].rstrip()
+-                except (json.JSONDecodeError, KeyError, IndexError, AttributeError, TypeError):
++                    if directives.get('stream') and response.text.startswith('data:'):
++                        chunks = []
++                        done = False
++                        for line in response.text.splitlines():
++                            if line == 'data: [DONE]':
++                                done = True
++                            elif line.startswith('data: '):
++                                event = json.loads(line[6:])
++                                done = done or any(c.get('finish_reason') == 'stop' for c in event['choices'])
++                                chunks.extend(c.get('delta', {}).get('content') or '' for c in event['choices'])
++                        if not done:
++                            raise ValueError('Incomplete model stream')
++                        summary = ''.join(chunks).strip()
++                    else:
++                        result = json.loads(re.split(r'\s*data: \[DONE\]\s*$', response.text, maxsplit=1)[0])
++                        summary = result['choices'][0]['message']['content'].strip()
++                    if not summary:
++                        raise ValueError('Empty model response')
++                except (ValueError, KeyError, IndexError, AttributeError, TypeError):
+                     summary = '## ERROR in summarizing changes using OpenAI-compatible AI:\nModel did not return any candidate output.'
+                     continue
+                 return summary, model
+diff --git a/webchanges/filters/_text.py b/webchanges/filters/_text.py
+index ec9c4fe..1e8af21 100644
+--- a/webchanges/filters/_text.py
++++ b/webchanges/filters/_text.py
+@@ -14,6 +14,19 @@ from webchanges.filters._base import FilterBase
+ logger = logging.getLogger(__name__)
+ 
+ 
++class RejectTextFilter(FilterBase):
++    """Fail a fetch when its text matches a known access-block page."""
++
++    __kind__ = 'reject_text'
++    __supported_subfilters__ = {'pattern': 'Regular expression identifying an invalid response.'}
++
++    def filter(self, data: str | bytes, mime_type: str, subfilter: dict[str, Any]) -> tuple[str | bytes, str]:
++        text = data.decode() if isinstance(data, bytes) else data
++        if re.search(subfilter['pattern'], text, re.IGNORECASE):
++            raise ValueError('Source returned an access-block page; check browser access or configure a browser job.')
++        return data, mime_type
++
++
+ class BetweenLinesFilter(FilterBase):
+     """Extract the lines between a starting and an ending pattern."""
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,3 +1,21 @@
+This fork follows upstream `webchanges <https://github.com/mborsetti/webchanges>`__ with ordered patches `0001 <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0001-add-OpenAI-compatible-AI-differ-with-email-integration-coverage.patch>`__, `0002 <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0002-support-file-backed-AI-API-keys.patch>`__, `0003 <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0003-support-quiet-AI-change-filtering.patch>`__, `0004 <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0004-add-compact-HTML-change-digests.patch>`__, `0005 <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0005-suppress-AI-failures-from-change-reports.patch>`__, `0006 <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0006-show-actionable-fetch-errors-after-digest-content.patch>`__, `0007 <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0007-handle-streamed-newsletter-summaries-reject-silent-failures.patch>`__, `0008 <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0008-forward-reasoning-effort-to-OpenAI-compatible-models.patch>`__. ``patch-queue`` owns workflows and patches; generated ``main`` contains upstream source plus all patches. Stable builds follow upstream releases; nightly builds follow upstream default branch.
+
+Patched webchanges
+==================
+
+Applied patches, oldest first:
+
+1. `0001-add-OpenAI-compatible-AI-differ-with-email-integration-coverage.patch <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0001-add-OpenAI-compatible-AI-differ-with-email-integration-coverage.patch>`__
+2. `0002-support-file-backed-AI-API-keys.patch <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0002-support-file-backed-AI-API-keys.patch>`__
+3. `0003-support-quiet-AI-change-filtering.patch <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0003-support-quiet-AI-change-filtering.patch>`__
+4. `0004-add-compact-HTML-change-digests.patch <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0004-add-compact-HTML-change-digests.patch>`__
+5. `0005-suppress-AI-failures-from-change-reports.patch <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0005-suppress-AI-failures-from-change-reports.patch>`__
+6. `0006-show-actionable-fetch-errors-after-digest-content.patch <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0006-show-actionable-fetch-errors-after-digest-content.patch>`__
+7. `0007-handle-streamed-newsletter-summaries-reject-silent-failures.patch <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0007-handle-streamed-newsletter-summaries-reject-silent-failures.patch>`__
+8. `0008-forward-reasoning-effort-to-OpenAI-compatible-models.patch <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0008-forward-reasoning-effort-to-OpenAI-compatible-models.patch>`__
+
+----
+
 .. role:: underline
     :class: underline
 .. role:: additions
@@ -110,6 +128,24 @@ Schedule
   .com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/ScheduledJobs.html>`__ (help `here
   <https://launchd.info/>`__).
 
+
+Downstream patches
+==================
+
+Generated branches replay these patches, in order, on upstream ``main`` or latest upstream release tag:
+
+.. code-block:: text
+
+   0001-add-OpenAI-compatible-AI-differ.patch
+   0002-support-file-backed-AI-API-keys.patch
+   0003-support-quiet-AI-change-filtering.patch
+   0004-add-compact-HTML-change-digests.patch
+   0005-suppress-AI-failures-from-change-reports.patch
+   0006-add-OpenAI-email-integration-coverage.patch
+   0007-show-actionable-fetch-errors-after-digest-content.patch
+   0008-support-streamed-newsletter-summaries-reject-silent-.patch
+   0009-accept-explicit-stop-completion-in-model-streams.patch
+   0010-forward-reasoning-effort-to-OpenAI-compatible-models.patch
 
 Code
 ====

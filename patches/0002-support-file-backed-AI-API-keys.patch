@@ -1,0 +1,81 @@
+From ccc46d585d65db8732f3be8f0ec42fb045e42cc1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Felix=20F=C3=B6rtsch?= <mail@felixfoertsch.de>
+Date: Thu, 8 Oct 2026 09:36:53 +0200
+Subject: [PATCH] support file-backed AI API keys
+
+---
+ tests/test_differs.py | 24 ++++++++++++++++++++++++
+ webchanges/differs.py |  8 +++++++-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/tests/test_differs.py b/tests/test_differs.py
+index d57f48e..207fd33 100644
+--- a/tests/test_differs.py
++++ b/tests/test_differs.py
+@@ -1329,6 +1329,30 @@ def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pyte
+     assert request_data[1]['messages'][0] == {'role': 'system', 'content': 'Be terse.'}
+ 
+ 
++def test_ai_openai_reads_api_key_file(monkeypatch: pytest.MonkeyPatch, job_state: JobState, tmp_path: Path) -> None:
++    key_file = tmp_path / 'api-key'
++    key_file.write_text('file-key\n')
++    request_headers: list[httpx.Headers] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        request_headers.append(request.headers)
++        return httpx.Response(200, json={'choices': [{'message': {'content': 'Changed.'}}]}, request=request)
++
++    client = httpx.Client
++    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
++    monkeypatch.setattr(
++        differs.httpx,
++        'Client',
++        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
++    )
++    job_state.old_data = 'old\n'
++    job_state.new_data = 'new\n'
++    job_state.job.differ = {'name': 'ai_openai', 'api_key_file': str(key_file)}
++
++    assert job_state.get_diff().startswith('Changed.')
++    assert request_headers[0]['authorization'] == 'Bearer file-key'
++
++
+ def test_ai_openai_requires_api_key(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
+     monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+     job_state.old_data = 'old\n'
+diff --git a/webchanges/differs.py b/webchanges/differs.py
+index aff6a31..9c8efbb 100644
+--- a/webchanges/differs.py
++++ b/webchanges/differs.py
+@@ -108,6 +108,7 @@ AiOpenAIDirectives = TypedDict(
+     {
+         'api_url': str,
+         'api_key_env': str,
++        'api_key_file': str,
+         'model': str,
+         'models': list[str],
+         'timeout': int,
+@@ -2279,6 +2280,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
+     __supported_directives__: dict[str, str] = {
+         'api_url': 'chat completions API URL (default: http://127.0.0.1:20128/v1/chat/completions)',
+         'api_key_env': 'environment variable containing API key (default: OPENAI_API_KEY)',
++        'api_key_file': 'file containing API key (takes precedence over api_key_env)',
+         'model': 'model name (default: gpt-4o-mini)',
+         'models': 'model names to try sequentially when model is not set',
+         'system_instructions': 'optional tone and style instructions for model',
+@@ -2304,7 +2306,11 @@ class AIOpenAIDiffer(AIGoogleDiffer):
+         if directives is None:
+             directives = {}
+         api_key_env = directives.get('api_key_env', 'OPENAI_API_KEY')
+-        api_key = os.environ.get(api_key_env, '').rstrip()
++        api_key_file = directives.get('api_key_file')
++        try:
++            api_key = Path(api_key_file).read_text().rstrip() if api_key_file else os.environ.get(api_key_env, '').rstrip()
++        except OSError:
++            api_key = ''
+         if not api_key:
+             logger.error(f'Job {job.index_number}: Environment variable {api_key_env} not found ({job.get_location()})')
+             return f'## ERROR in summarizing changes using OpenAI-compatible AI:\nEnvironment variable {api_key_env} not found.', ''
+-- 
+2.54.0 (Apple Git-157)
+

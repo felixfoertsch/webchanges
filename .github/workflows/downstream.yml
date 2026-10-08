@@ -1,0 +1,186 @@
+name: Downstream builds
+
+on:
+  push:
+    branches: [patch-queue]
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: downstream-builds
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.repository == 'felixfoertsch/webchanges' && github.ref == 'refs/heads/patch-queue'
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_main: ${{ steps.refs.outputs.upstream_main }}
+      stable_base: ${{ steps.refs.outputs.stable_base }}
+      stable_upstream: ${{ steps.refs.outputs.stable_upstream }}
+      stable_commit: ${{ steps.refs.outputs.stable_commit }}
+      stable_tag: ${{ steps.refs.outputs.stable_tag }}
+      nightly_commit: ${{ steps.refs.outputs.nightly_commit }}
+      nightly_tag: ${{ steps.refs.outputs.nightly_tag }}
+      main_lease: ${{ steps.refs.outputs.main_lease }}
+    steps:
+      - uses: actions/checkout@v6
+        with: {ref: '${{ github.sha }}', fetch-depth: 0, persist-credentials: false}
+      - id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags https://github.com/mborsetti/webchanges.git +refs/heads/main:refs/remotes/upstream/main '+refs/tags/*:refs/tags/upstream/*'
+          upstream_main=$(git rev-parse upstream/main); stable_base=$(gh api repos/mborsetti/webchanges/releases/latest --jq .tag_name)
+          stable_upstream=$(git rev-parse "refs/tags/upstream/$stable_base^{commit}")
+          main_lease=$(git ls-remote --heads origin refs/heads/main | cut -f1)
+          stable_commit=$(python3 scripts/replay_patches.py --base "$stable_upstream")
+          nightly_commit=$(python3 scripts/replay_patches.py --base "$upstream_main")
+          git ls-remote --tags --refs origin > "$RUNNER_TEMP/tags"
+          stable_tag=$(python3 scripts/release_tag.py --upstream "$stable_base" --channel stable --commit "$stable_commit" < "$RUNNER_TEMP/tags")
+          nightly_tag=$(python3 scripts/release_tag.py --upstream "$stable_base" --channel nightly --commit "$nightly_commit" < "$RUNNER_TEMP/tags")
+          printf 'upstream_main=%s\nstable_base=%s\nstable_upstream=%s\nstable_commit=%s\nstable_tag=%s\nnightly_commit=%s\nnightly_tag=%s\nmain_lease=%s\n' "$upstream_main" "$stable_base" "$stable_upstream" "$stable_commit" "$stable_tag" "$nightly_commit" "$nightly_tag" "$main_lease" >> "$GITHUB_OUTPUT"
+
+  build:
+    if: github.repository == 'felixfoertsch/webchanges' && github.ref == 'refs/heads/patch-queue'
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: {channel: [stable, nightly]}
+    steps:
+      - uses: actions/checkout@v6
+        with: {ref: '${{ github.sha }}', fetch-depth: 0, persist-credentials: false}
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.14'}
+      - name: Build isolated candidate
+        env:
+          CHANNEL: ${{ matrix.channel }}
+          BASE: ${{ matrix.channel == 'stable' && needs.prepare.outputs.stable_upstream || needs.prepare.outputs.upstream_main }}
+          COMMIT: ${{ matrix.channel == 'stable' && needs.prepare.outputs.stable_commit || needs.prepare.outputs.nightly_commit }}
+          TAG: ${{ matrix.channel == 'stable' && needs.prepare.outputs.stable_tag || needs.prepare.outputs.nightly_tag }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/mborsetti/webchanges.git +refs/heads/main:refs/remotes/upstream/main '+refs/tags/*:refs/tags/upstream/*'
+          source="$RUNNER_TEMP/source"
+          test "$(python3 scripts/replay_patches.py --base "$BASE" --output "$source")" = "$COMMIT"
+          python -m pip install build
+          python - "$source" "$TAG" <<'PY'
+          import sys, re
+          from pathlib import Path
+          from scripts.package_candidate import version
+          source = Path(sys.argv[1]); expected = version(source, sys.argv[2])
+          path = source / 'webchanges/__init__.py'
+          path.write_text(re.sub(r'(__version__ = [\'\"])([^\'\"]+)', lambda m: m[1] + expected, path.read_text()))
+          PY
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$COMMIT")
+          python -m pip install "$source" -r "$source/tests/requirements_pytest.txt"
+          (cd "$source" && python -m pytest tests/test_differs.py tests/test_reporters.py tests/test_newsletter_failures.py -q -k 'not test_mailer_send')
+          python -m build "$source"
+          python scripts/normalize_sdist.py "$source"/dist/*.tar.gz "$SOURCE_DATE_EPOCH"
+          mkdir "$RUNNER_TEMP/candidate"
+          mv "$source/dist" "$RUNNER_TEMP/candidate/dist"
+          python scripts/package_candidate.py --source "$source" --dist "$RUNNER_TEMP/candidate/dist" --tag "$TAG" --commit "$COMMIT" --manifest "$RUNNER_TEMP/candidate/provenance.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-${{ matrix.channel }}
+          path: ${{ runner.temp }}/candidate
+          if-no-files-found: error
+
+  publish:
+    if: github.repository == 'felixfoertsch/webchanges' && github.ref == 'refs/heads/patch-queue'
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with: {ref: '${{ github.sha }}', fetch-depth: 0, persist-credentials: false}
+      - uses: actions/download-artifact@v4
+        with: {name: candidate-stable, path: '${{ runner.temp }}/candidate-stable'}
+      - uses: actions/download-artifact@v4
+        with: {name: candidate-nightly, path: '${{ runner.temp }}/candidate-nightly'}
+      - name: Reconstruct and validate both candidates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_BASE: ${{ needs.prepare.outputs.stable_base }}
+          STABLE_UPSTREAM: ${{ needs.prepare.outputs.stable_upstream }}
+          UPSTREAM_MAIN: ${{ needs.prepare.outputs.upstream_main }}
+          STABLE_COMMIT: ${{ needs.prepare.outputs.stable_commit }}
+          NIGHTLY_COMMIT: ${{ needs.prepare.outputs.nightly_commit }}
+          STABLE_TAG: ${{ needs.prepare.outputs.stable_tag }}
+          NIGHTLY_TAG: ${{ needs.prepare.outputs.nightly_tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags https://github.com/mborsetti/webchanges.git +refs/heads/main:refs/remotes/upstream/main '+refs/tags/*:refs/tags/upstream/*'
+          for channel in stable nightly; do
+            if [ "$channel" = stable ]; then base=$STABLE_UPSTREAM; commit=$STABLE_COMMIT; tag=$STABLE_TAG; else base=$UPSTREAM_MAIN; commit=$NIGHTLY_COMMIT; tag=$NIGHTLY_TAG; fi
+            test "$(python3 scripts/replay_patches.py --base "$base" --output "$RUNNER_TEMP/source-$channel")" = "$commit"
+            lease=$(git ls-remote --tags origin "refs/tags/$tag" | cut -f1)
+            if [ -n "$lease" ]; then git fetch --no-tags origin "refs/tags/$tag"; test "$(git rev-parse FETCH_HEAD^{commit})" = "$commit"; fi
+            candidate="$RUNNER_TEMP/candidate-$channel"
+            python3 scripts/package_candidate.py --source "$RUNNER_TEMP/source-$channel" --dist "$candidate/dist" --tag "$tag" --commit "$commit" --manifest "$candidate/provenance.json" --verify
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[]' > "$RUNNER_TEMP/releases"
+            jq -s --arg tag "$tag" 'map(select(.tag_name == $tag)) | if length > 1 then error("duplicate release") else .[0] // empty end' "$RUNNER_TEMP/releases" > "$candidate/release.json"
+            if [ -s "$candidate/release.json" ]; then
+              assets=("$candidate"/dist/*)
+              python3 scripts/release_state.py "$candidate/release.json" --commit "$commit" --asset "$(basename "${assets[0]}")" --asset "$(basename "${assets[1]}")" --dist "$candidate/dist"
+            fi
+          done
+      - name: Promote validated source and immutable releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_BASE: ${{ needs.prepare.outputs.stable_base }}
+          STABLE_UPSTREAM: ${{ needs.prepare.outputs.stable_upstream }}
+          UPSTREAM_MAIN: ${{ needs.prepare.outputs.upstream_main }}
+          STABLE_COMMIT: ${{ needs.prepare.outputs.stable_commit }}
+          NIGHTLY_COMMIT: ${{ needs.prepare.outputs.nightly_commit }}
+          STABLE_TAG: ${{ needs.prepare.outputs.stable_tag }}
+          NIGHTLY_TAG: ${{ needs.prepare.outputs.nightly_tag }}
+          MAIN_LEASE: ${{ needs.prepare.outputs.main_lease }}
+        run: |
+          set -euo pipefail
+          freshness() {
+            test "$(git ls-remote --heads origin refs/heads/patch-queue | cut -f1)" = "$GITHUB_SHA"
+            test "$(git ls-remote --heads https://github.com/mborsetti/webchanges.git refs/heads/main | cut -f1)" = "$UPSTREAM_MAIN"
+            test "$(gh api repos/mborsetti/webchanges/releases/latest --jq .tag_name)" = "$STABLE_BASE"
+            git fetch --no-tags https://github.com/mborsetti/webchanges.git '+refs/tags/*:refs/tags/upstream/*'
+            test "$(git rev-parse "refs/tags/upstream/$STABLE_BASE^{commit}")" = "$STABLE_UPSTREAM"
+          }
+          freshness
+          # Only trusted control code runs here; credentials exist only for pushes/API calls.
+          git -c credential.helper='!gh auth git-credential' push origin "$NIGHTLY_COMMIT:refs/heads/main" --force-with-lease="refs/heads/main:$MAIN_LEASE"
+          for channel in stable nightly; do
+            if [ "$channel" = stable ]; then commit=$STABLE_COMMIT; tag=$STABLE_TAG; else commit=$NIGHTLY_COMMIT; tag=$NIGHTLY_TAG; fi
+            freshness
+            lease=$(git ls-remote --tags origin "refs/tags/$tag" | cut -f1)
+            if [ -n "$lease" ]; then
+              git fetch --no-tags origin "refs/tags/$tag"
+              test "$(git rev-parse FETCH_HEAD^{commit})" = "$commit"
+            else
+              git -c credential.helper='!gh auth git-credential' push origin "$commit:refs/tags/$tag" --force-with-lease="refs/tags/$tag:"
+            fi
+            candidate="$RUNNER_TEMP/candidate-$channel"; assets=("$candidate"/dist/*)
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[]' > "$RUNNER_TEMP/releases"
+            jq -s --arg tag "$tag" 'map(select(.tag_name == $tag)) | if length > 1 then error("duplicate release") else .[0] // empty end' "$RUNNER_TEMP/releases" > "$candidate/release.json"
+            if [ ! -s "$candidate/release.json" ]; then
+              gh api --method POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$tag" -f target_commitish="$commit" -f name="webchanges $tag" -F draft=true > "$candidate/release.json"
+            fi
+            state=$(python3 scripts/release_state.py "$candidate/release.json" --commit "$commit" --asset "$(basename "${assets[0]}")" --asset "$(basename "${assets[1]}")" --dist "$candidate/dist")
+            if [ "$state" = complete ]; then continue; fi
+            for asset in "${assets[@]}"; do
+              if ! jq -e --arg name "$(basename "$asset")" '.assets[] | select(.name == $name)' "$candidate/release.json" >/dev/null; then gh release upload "$tag" "$asset"; fi
+            done
+            release_id=$(jq -er .id "$candidate/release.json")
+            gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$candidate/release.json"
+            python3 scripts/release_state.py "$candidate/release.json" --commit "$commit" --asset "$(basename "${assets[0]}")" --asset "$(basename "${assets[1]}")" --dist "$candidate/dist" --require-complete
+            freshness
+            flags=(); [ "$channel" != nightly ] || flags+=(--prerelease --latest=false)
+            gh release edit "$tag" --draft=false "${flags[@]}"
+          done

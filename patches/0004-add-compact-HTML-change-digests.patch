@@ -1,0 +1,254 @@
+From 748ada20c74180d657552c873ef8b7befff20f78 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Felix=20F=C3=B6rtsch?= <mail@felixfoertsch.de>
+Date: Thu, 8 Oct 2026 09:36:54 +0200
+Subject: [PATCH] add compact HTML change digests
+
+---
+ docs/configuration.rst                      |  3 ++-
+ docs/differs.rst                            |  3 ++-
+ tests/data/config.yaml                      |  1 +
+ tests/test_differs.py                       | 19 ++++++++++++++
+ tests/test_reporters.py                     | 13 +++++++++
+ webchanges/_resources/.config.schema.sha256 |  2 +-
+ webchanges/_resources/config.schema.json    |  7 ++++-
+ webchanges/differs.py                       |  8 ++++++
+ webchanges/reporters/_base.py               | 29 +++++++++++++++++++++
+ webchanges/storage/_config.py               |  2 ++
+ 10 files changed, 83 insertions(+), 4 deletions(-)
+
+diff --git a/docs/configuration.rst b/docs/configuration.rst
+index a906f42..a4bf07d 100644
+--- a/docs/configuration.rst
++++ b/docs/configuration.rst
+@@ -76,7 +76,8 @@ Any report- or reporter-specific configuration must be inside the ``report`` dir
+ 
+ ``text``, ``html`` and ``markdown`` are report types, and their settings apply to all reporters that use that type of
+ report (for example, the ``stdout`` reporter uses ``text``, while the ``email`` reporter with ``html: true`` uses
+-``html``; see :ref:`reporters <reporters>` for details).
++``html``; see :ref:`reporters <reporters>` for details). Set ``report.html.compact: true`` for compact,
++mobile-friendly HTML email cards.
+ 
+ Here is an example configuration that reports using UTC timezone on standard output in color, as well as HTML email
+ (one report for each job) using an SMTP server:
+diff --git a/docs/differs.rst b/docs/differs.rst
+index 2c3920b..ba98e6d 100644
+--- a/docs/differs.rst
++++ b/docs/differs.rst
+@@ -188,7 +188,8 @@ set ``api_key_env`` to use another environment variable.
+ 
+ ``model`` selects one model. ``models`` supplies fallback models tried sequentially when ``model`` is absent.
+ ``timeout``, ``max_output_tokens``, ``temperature``, ``top_p``, ``system_instructions``, ``prompt``, ``additions_only``,
+-``prompt_ud_context_lines``, and ``unified`` behave like :ref:`ai_google <ai_google_diff>`.
++``prompt_ud_context_lines``, and ``unified`` behave like :ref:`ai_google <ai_google_diff>`. Set ``summary_only: true``
++to omit unified diff and AI model/directive footer from all report formats.
+ 
+ Example:
+ 
+diff --git a/tests/data/config.yaml b/tests/data/config.yaml
+index 2077835..37d41f1 100644
+--- a/tests/data/config.yaml
++++ b/tests/data/config.yaml
+@@ -17,6 +17,7 @@ report:
+     footer: true
+     separate: false
+     title: '[webchanges] {count} changes{jobs_files}: {jobs}'
++    compact: false
+   markdown:
+     details: true
+     footer: true
+diff --git a/tests/test_differs.py b/tests/test_differs.py
+index a597de5..f4b3853 100644
+--- a/tests/test_differs.py
++++ b/tests/test_differs.py
+@@ -1329,6 +1329,25 @@ def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pyte
+     assert request_data[1]['messages'][0] == {'role': 'system', 'content': 'Be terse.'}
+ 
+ 
++def test_ai_openai_summary_only(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
++    def handler(request: httpx.Request) -> httpx.Response:
++        return httpx.Response(200, json={'choices': [{'message': {'content': 'Changed.'}}]}, request=request)
++
++    client = httpx.Client
++    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
++    monkeypatch.setattr(
++        differs.httpx,
++        'Client',
++        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
++    )
++    job_state.old_data = 'old\n'
++    job_state.new_data = 'new\n'
++    job_state.job.differ = {'name': 'ai_openai', 'summary_only': True}
++
++    assert job_state.get_diff() == 'Changed.'
++    assert job_state.get_diff('html') == 'Changed.'
++
++
+ def test_ai_openai_reads_api_key_file(monkeypatch: pytest.MonkeyPatch, job_state: JobState, tmp_path: Path) -> None:
+     key_file = tmp_path / 'api-key'
+     key_file.write_text('file-key\n')
+diff --git a/tests/test_reporters.py b/tests/test_reporters.py
+index 1563d8c..fcbdc2f 100644
+--- a/tests/test_reporters.py
++++ b/tests/test_reporters.py
+@@ -19,6 +19,7 @@ except ImportError:
+ from webchanges.handler import JobState, Report
+ from webchanges.jobs import JobBase
+ from webchanges.mailer import SMTPMailer, smtp_have_password, smtp_set_password
++from webchanges.reporters import HtmlReporter
+ from webchanges.storage import DEFAULT_CONFIG
+ 
+ try:
+@@ -135,6 +136,18 @@ def build_test_report() -> Report:
+     return test_report
+ 
+ 
++def test_compact_html_report() -> None:
++    test_report = build_test_report()
++    test_report.config['report']['html']['compact'] = True
++    html = '\n'.join(HtmlReporter(test_report, {}, test_report.job_states, 1, [], {}).submit())
++
++    assert '<div style="max-width:600px;margin:0 auto;padding:16px;">' in html
++    card_style = 'style="margin:0 0 16px;padding:16px;background:#ffffff;border:1px solid #d0d7de;border-radius:6px;"'
++    assert html.count(card_style) == 3
++    assert '<a href="https://example.com/changed"' in html
++    assert 'Something Changed</a>' in html
++
++
+ @pytest.mark.filterwarnings('ignore::getpass.GetPassWarning')  # headless runs cannot control terminal echo
+ def test_smtp_password() -> None:
+     if NoKeyringError is not None:
+diff --git a/webchanges/_resources/.config.schema.sha256 b/webchanges/_resources/.config.schema.sha256
+index c3b42ec..23afa6c 100644
+--- a/webchanges/_resources/.config.schema.sha256
++++ b/webchanges/_resources/.config.schema.sha256
+@@ -1 +1 @@
+-0e840e6d686d6b429b81e7af995aa28ae11010c647e6c27c8ed885c034e96e7c
++889ab83ae00546d3608210f34c57aa2140405033ab646b5ba56558a37a3a55b1
+diff --git a/webchanges/_resources/config.schema.json b/webchanges/_resources/config.schema.json
+index 9d0ab1b..f1c0992 100644
+--- a/webchanges/_resources/config.schema.json
++++ b/webchanges/_resources/config.schema.json
+@@ -103,7 +103,7 @@
+       "title": "HTML report format",
+       "description": "Settings for the HTML report (used by browser, email with html: true).",
+       "type": "object",
+-      "required": ["diff", "footer", "separate", "title"],
++      "required": ["diff", "footer", "separate", "title", "compact"],
+       "properties": {
+         "diff": {
+           "enum": ["unified", "table"],
+@@ -125,6 +125,11 @@
+           "type": "string",
+           "description": "The HTML document title. Use {count} for the number of reports, {jobs} for the title of jobs reported, and {jobs_files} for a space followed by the name(s) of the jobs file(s) (in parentheses, with a leading 'jobs-' stripped) when not using the default jobs.yaml.",
+           "default": "[webchanges] {count} changes{jobs_files}: {jobs}"
++        },
++        "compact": {
++          "type": "boolean",
++          "description": "Use compact, mobile-friendly HTML email cards.",
++          "default": false
+         }
+       }
+     },
+diff --git a/webchanges/differs.py b/webchanges/differs.py
+index 8f755d3..97266e7 100644
+--- a/webchanges/differs.py
++++ b/webchanges/differs.py
+@@ -120,6 +120,7 @@ AiOpenAIDirectives = TypedDict(
+         'additions_only': str,
+         'prompt_ud_context_lines': int,
+         'no_report_if': str,
++        'summary_only': bool,
+         'unified': dict[str, Any],
+     },
+     total=False,
+@@ -2247,6 +2248,12 @@ class AIGoogleDiffer(DifferBase):
+             if model_version or directives_text
+             else ''
+         )
++        if self.__kind__ == 'ai_openai' and directives.get('summary_only'):
++            return {
++                'plain': summary,
++                'markdown': summary,
++                'html': mark_to_html(summary, extras={'tables'}).replace('<h2>', '<h3>').replace('</h2>', '</h3>'),
++            }
+         temp_unfiltered_diff: dict[ReportKind, str] = {}
+         for rep_kind in ('plain', 'html'):  # markdown is same as text
+             unified_report = DifferBase.process(
+@@ -2293,6 +2300,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
+         'temperature': "model's Temperature parameter (default: 0.0)",
+         'top_p': "model's TopP parameter (default: 1.0 when temperature is 0.0)",
+         'no_report_if': 'suppress report when model output exactly matches this string',
++        'summary_only': 'show only AI summary; omit unified diff and AI footer (default: false)',
+         'unified': 'directives passed to unified differ (default: None)',
+     }
+     __default_directive__ = 'model'
+diff --git a/webchanges/reporters/_base.py b/webchanges/reporters/_base.py
+index b84a211..70b1bf1 100644
+--- a/webchanges/reporters/_base.py
++++ b/webchanges/reporters/_base.py
+@@ -301,6 +301,9 @@ class HtmlReporter(ReporterBase):
+         if not filtered_job_states:
+             return
+         title = self.subject_with_args(filtered_job_states, self.report.config['report']['html']['title'])
++        if self.report.config['report']['html']['compact']:
++            yield from self._compact_parts(filtered_job_states, cfg, title)
++            return
+ 
+         yield (
+             '<!DOCTYPE html>\n'
+@@ -369,6 +372,32 @@ class HtmlReporter(ReporterBase):
+                 )
+         yield '</span>\n</body>\n</html>\n'
+ 
++    def _compact_parts(self, job_states: list[JobState], cfg: dict[str, Any], title: str) -> Iterable[str]:
++        """Yield compact, email-safe HTML cards."""
++        yield (
++            '<!DOCTYPE html><html><head>'
++            f'<title>{html.escape(title)}</title>'
++            '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
++            '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
++            '</head><body style="margin:0;background:#f6f8fa;font-family:Arial,Helvetica,sans-serif;color:#24292f;">'
++            '<div style="max-width:600px;margin:0 auto;padding:16px;">'
++        )
++        for job_state in job_states:
++            differ = job_state.job.differ or {'name': cfg['diff']}
++            content = self._format_content(job_state, differ)
++            if content is None or job_state.verb == 'changed,no_report':
++                continue
++            location = html.escape(job_state.job.get_location())
++            name = html.escape(job_state.job.pretty_name())
++            source = f'<a href="{location}" style="color:#0969da;text-decoration:none;">{name}</a>'
++            yield '<div style="margin:0 0 16px;padding:16px;background:#ffffff;border:1px solid #d0d7de;border-radius:6px;">'
++            yield f'<div style="margin:0 0 12px;font-size:18px;font-weight:bold;">{source}</div>'
++            if hasattr(job_state.job, 'note') and job_state.job.note:
++                yield f'<div style="margin:0 0 12px;color:#57606a;">{self.markdown_to_html(job_state.job.note)}</div>'
++            yield f'<div style="font-size:14px;line-height:1.5;overflow-wrap:anywhere;">{content}</div>'
++            yield '</div>'
++        yield '</div></body></html>'
++
+     @staticmethod
+     def markdown_to_html(text: str, markdown_padded_tables: bool | None = None) -> str:
+         """Return an html representation of a markdown string."""
+diff --git a/webchanges/storage/_config.py b/webchanges/storage/_config.py
+index 7bc3074..1ec926e 100644
+--- a/webchanges/storage/_config.py
++++ b/webchanges/storage/_config.py
+@@ -39,6 +39,7 @@ class _ConfigReportHtml(TypedDict):
+     footer: bool
+     separate: bool
+     title: str
++    compact: bool
+ 
+ 
+ class _ConfigReportMarkdown(TypedDict):
+@@ -309,6 +310,7 @@ DEFAULT_CONFIG: _Config = {
+             'footer': True,
+             'separate': False,
+             'title': f'[{__project_name__}] {{count}} changes{{jobs_files}}: {{jobs}}',
++            'compact': False,
+         },
+         'markdown': {
+             'details': True,  # whether the diff is sent
+-- 
+2.54.0 (Apple Git-157)
+

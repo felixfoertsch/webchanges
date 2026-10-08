@@ -276,7 +276,14 @@ def test_reporters(reporter: str, capsys: pytest.CaptureFixture) -> None:
                 test_report.finish_one(reporter, check_enabled=False)
 
 
-def test_mailer_send() -> None:
+def test_mailer_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import MagicMock
+
+    server = MagicMock()
+    server.__enter__.return_value = server
+    server.login.side_effect = SMTPAuthenticationError(535, b'Invalid credentials')
+    smtp = MagicMock(return_value=server)
+    monkeypatch.setattr('webchanges.mailer.smtplib.SMTP', smtp)
     mailer = SMTPMailer(
         smtp_user='test@gmail.com',
         smtp_server='smtp.gmail.com',
@@ -288,3 +295,7 @@ def test_mailer_send() -> None:
     with pytest.raises(SMTPAuthenticationError) as pytest_wrapped_e:
         mailer.send(msg=None)
     assert pytest_wrapped_e.value.smtp_code == 535
+    smtp.assert_called_once_with('smtp.gmail.com', 587)
+    server.starttls.assert_called_once_with()
+    server.login.assert_called_once_with('test@gmail.com', 'password')
+    server.send_message.assert_not_called()

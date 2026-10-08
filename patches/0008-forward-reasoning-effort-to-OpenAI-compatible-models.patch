@@ -1,0 +1,54 @@
+From 5186356124cacdfd1eabc7610b1a00f3dd26ccc9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Felix=20F=C3=B6rtsch?= <mail@felixfoertsch.de>
+Date: Thu, 8 Oct 2026 09:36:54 +0200
+Subject: [PATCH] forward reasoning effort to OpenAI-compatible models
+
+---
+ tests/test_differs.py | 2 ++
+ webchanges/differs.py | 3 +++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/tests/test_differs.py b/tests/test_differs.py
+index 3caeb35..cd9edd0 100644
+--- a/tests/test_differs.py
++++ b/tests/test_differs.py
+@@ -1311,6 +1311,7 @@ def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pyte
+         'api_url': 'https://example.test/v1/chat/completions',
+         'models': ['bad', 'good'],
+         'max_output_tokens': 42,
++        'reasoning_effort': 'low',
+         'temperature': 0.2,
+         'top_p': 0.8,
+         'system_instructions': 'Be terse.',
+@@ -1324,6 +1325,7 @@ def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pyte
+     assert [data['model'] for data in request_data] == ['bad', 'good']
+     assert requests[1].headers['authorization'] == 'Bearer test-key'
+     assert request_data[1]['max_tokens'] == 42
++    assert request_data[1]['reasoning_effort'] == 'low'
+     assert request_data[1]['temperature'] == 0.2
+     assert request_data[1]['top_p'] == 0.8
+     assert request_data[1]['messages'][0] == {'role': 'system', 'content': 'Be terse.'}
+diff --git a/webchanges/differs.py b/webchanges/differs.py
+index 5991d8f..2899e7c 100644
+--- a/webchanges/differs.py
++++ b/webchanges/differs.py
+@@ -2298,6 +2298,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
+         'prompt_ud_context_lines': 'number of context lines for {unified_diff} (default: 9999)',
+         'timeout': 'number of seconds before timing out API call (default: 300)',
+         'max_output_tokens': "maximum tokens returned by model (default: model's default)",
++        'reasoning_effort': "model's reasoning effort (default: model's default)",
+         'temperature': "model's Temperature parameter (default: 0.0)",
+         'top_p': "model's TopP parameter (default: 1.0 when temperature is 0.0)",
+         'no_report_if': 'suppress report when model output exactly matches this string',
+@@ -2341,6 +2342,8 @@ class AIOpenAIDiffer(AIGoogleDiffer):
+         }
+         if directives.get('max_output_tokens') is not None:
+             data['max_tokens'] = directives['max_output_tokens']
++        if directives.get('reasoning_effort') is not None:
++            data['reasoning_effort'] = directives['reasoning_effort']
+         if directives.get('stream'):
+             data['stream'] = True
+ 
+-- 
+2.54.0 (Apple Git-157)
+

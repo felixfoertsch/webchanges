@@ -1,0 +1,84 @@
+From 6375a819d86283fd60fe95ab632cca04f7968630 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Felix=20F=C3=B6rtsch?= <mail@felixfoertsch.de>
+Date: Thu, 8 Oct 2026 09:36:53 +0200
+Subject: [PATCH] support quiet AI change filtering
+
+---
+ tests/test_differs.py | 19 +++++++++++++++++++
+ webchanges/differs.py | 16 ++++++++++++++++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/tests/test_differs.py b/tests/test_differs.py
+index 207fd33..a597de5 100644
+--- a/tests/test_differs.py
++++ b/tests/test_differs.py
+@@ -1353,6 +1353,25 @@ def test_ai_openai_reads_api_key_file(monkeypatch: pytest.MonkeyPatch, job_state
+     assert request_headers[0]['authorization'] == 'Bearer file-key'
+ 
+ 
++def test_ai_openai_suppresses_marker(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
++    def handler(request: httpx.Request) -> httpx.Response:
++        return httpx.Response(200, json={'choices': [{'message': {'content': 'NO_REPORT'}}]}, request=request)
++
++    client = httpx.Client
++    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
++    monkeypatch.setattr(
++        differs.httpx,
++        'Client',
++        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
++    )
++    job_state.old_data = 'old\n'
++    job_state.new_data = 'new\n'
++    job_state.job.differ = {'name': 'ai_openai', 'no_report_if': 'NO_REPORT'}
++
++    assert job_state.get_diff() == ''
++    assert job_state.verb == 'changed,no_report'
++
++
+ def test_ai_openai_requires_api_key(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
+     monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+     job_state.old_data = 'old\n'
+diff --git a/webchanges/differs.py b/webchanges/differs.py
+index 9c8efbb..8f755d3 100644
+--- a/webchanges/differs.py
++++ b/webchanges/differs.py
+@@ -119,6 +119,7 @@ AiOpenAIDirectives = TypedDict(
+         'prompt': str,
+         'additions_only': str,
+         'prompt_ud_context_lines': int,
++        'no_report_if': str,
+         'unified': dict[str, Any],
+     },
+     total=False,
+@@ -2291,6 +2292,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
+         'max_output_tokens': "maximum tokens returned by model (default: model's default)",
+         'temperature': "model's Temperature parameter (default: 0.0)",
+         'top_p': "model's TopP parameter (default: 1.0 when temperature is 0.0)",
++        'no_report_if': 'suppress report when model output exactly matches this string',
+         'unified': 'directives passed to unified differ (default: None)',
+     }
+     __default_directive__ = 'model'
+@@ -2363,6 +2365,20 @@ class AIOpenAIDiffer(AIGoogleDiffer):
+ 
+         return summary, ''
+ 
++    def differ(
++        self,
++        directives: AiOpenAIDirectives,
++        report_kind: ReportKind,
++        _unfiltered_diff: dict[ReportKind, str] | None = None,
++        tz: tzinfo | None = None,
++    ) -> dict[ReportKind, str]:
++        result = super().differ(directives, report_kind, _unfiltered_diff, tz)
++        marker = directives.get('no_report_if')
++        if marker and any(value.split('\n', 1)[0].strip() == marker for value in result.values()):
++            self.state.verb = 'changed,no_report'
++            return {'plain': '', 'markdown': '', 'html': ''}
++        return result
++
+ 
+ class WdiffDiffer(DifferBase):
+     __kind__ = 'wdiff'
+-- 
+2.54.0 (Apple Git-157)
+
