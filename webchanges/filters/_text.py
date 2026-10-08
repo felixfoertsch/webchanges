@@ -14,6 +14,19 @@ from webchanges.filters._base import FilterBase
 logger = logging.getLogger(__name__)
 
 
+class RejectTextFilter(FilterBase):
+    """Fail a fetch when its text matches a known access-block page."""
+
+    __kind__ = 'reject_text'
+    __supported_subfilters__ = {'pattern': 'Regular expression identifying an invalid response.'}
+
+    def filter(self, data: str | bytes, mime_type: str, subfilter: dict[str, Any]) -> tuple[str | bytes, str]:
+        text = data.decode() if isinstance(data, bytes) else data
+        if re.search(subfilter['pattern'], text, re.IGNORECASE):
+            raise ValueError('Source returned an access-block page; check browser access or configure a browser job.')
+        return data, mime_type
+
+
 class BetweenLinesFilter(FilterBase):
     """Extract the lines between a starting and an ending pattern."""
 
