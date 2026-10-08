@@ -143,9 +143,41 @@ def test_compact_html_report() -> None:
 
     assert '<div style="max-width:600px;margin:0 auto;padding:16px;">' in html
     card_style = 'style="margin:0 0 16px;padding:16px;background:#ffffff;border:1px solid #d0d7de;border-radius:6px;"'
-    assert html.count(card_style) == 3
+    assert html.count(card_style) == 2
     assert '<a href="https://example.com/changed"' in html
     assert 'Something Changed</a>' in html
+
+
+@pytest.mark.parametrize('errors_only', [False, True])
+def test_compact_errors_follow_content(errors_only: bool) -> None:
+    report = build_test_report()
+    report.config['report']['html']['compact'] = True
+    error = report.job_states[-1]
+    error.new_error_data = {'type': 'ReadTimeout', 'message': 'The read operation timed out <again>'}
+    error.tries = 3
+    report.job_states = [error] if errors_only else [error, *report.job_states[:-1]]
+    output = '\n'.join(HtmlReporter(report, {}, report.job_states, 1, [], {}).submit())
+    assert 'Errors (1)' in output
+    assert 'ReadTimeout' in output
+    assert 'The read operation timed out &lt;again&gt;' in output
+    assert 'Consecutive failures: 3' in output
+    assert 'https://example.com/error' in output
+    assert 'timeout' in output
+    assert 'next scheduled run' in output
+    if not errors_only:
+        assert output.index('Something Changed</a>') < output.index('Errors (1)')
+
+
+def test_compact_suppressed_errors_do_not_leave_empty_section() -> None:
+    report = build_test_report()
+    report.config['report']['html']['compact'] = True
+    error = report.job_states[-1]
+    error.verb = 'error,repeated'
+    error.job.suppress_repeated_errors = True
+    output = '\n'.join(HtmlReporter(report, {}, report.job_states, 1, [], {}).submit())
+    assert 'Something Changed</a>' in output
+    assert 'Errors (' not in output
+    assert 'https://example.com/error' not in output
 
 
 @pytest.mark.filterwarnings('ignore::getpass.GetPassWarning')  # headless runs cannot control terminal echo
