@@ -1311,6 +1311,7 @@ def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pyte
         'api_url': 'https://example.test/v1/chat/completions',
         'models': ['bad', 'good'],
         'max_output_tokens': 42,
+        'reasoning_effort': 'low',
         'temperature': 0.2,
         'top_p': 0.8,
         'system_instructions': 'Be terse.',
@@ -1324,6 +1325,7 @@ def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pyte
     assert [data['model'] for data in request_data] == ['bad', 'good']
     assert requests[1].headers['authorization'] == 'Bearer test-key'
     assert request_data[1]['max_tokens'] == 42
+    assert request_data[1]['reasoning_effort'] == 'low'
     assert request_data[1]['temperature'] == 0.2
     assert request_data[1]['top_p'] == 0.8
     assert request_data[1]['messages'][0] == {'role': 'system', 'content': 'Be terse.'}
