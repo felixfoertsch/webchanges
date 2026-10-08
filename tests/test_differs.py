@@ -1353,6 +1353,25 @@ def test_ai_openai_reads_api_key_file(monkeypatch: pytest.MonkeyPatch, job_state
     assert request_headers[0]['authorization'] == 'Bearer file-key'
 
 
+def test_ai_openai_suppresses_marker(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={'choices': [{'message': {'content': 'NO_REPORT'}}]}, request=request)
+
+    client = httpx.Client
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+    monkeypatch.setattr(
+        differs.httpx,
+        'Client',
+        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    job_state.old_data = 'old\n'
+    job_state.new_data = 'new\n'
+    job_state.job.differ = {'name': 'ai_openai', 'no_report_if': 'NO_REPORT'}
+
+    assert job_state.get_diff() == ''
+    assert job_state.verb == 'changed,no_report'
+
+
 def test_ai_openai_requires_api_key(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
     monkeypatch.delenv('OPENAI_API_KEY', raising=False)
     job_state.old_data = 'old\n'
