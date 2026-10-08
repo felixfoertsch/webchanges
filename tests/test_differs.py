@@ -1348,6 +1348,25 @@ def test_ai_openai_summary_only(monkeypatch: pytest.MonkeyPatch, job_state: JobS
     assert job_state.get_diff('html') == 'Changed.'
 
 
+def test_ai_openai_suppresses_model_errors(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={'choices': []}, request=request)
+
+    client = httpx.Client
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+    monkeypatch.setattr(
+        differs.httpx,
+        'Client',
+        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    job_state.old_data = 'old\n'
+    job_state.new_data = 'new\n'
+    job_state.job.differ = {'name': 'ai_openai', 'no_report_on_error': True}
+
+    assert job_state.get_diff() == ''
+    assert job_state.verb == 'changed,no_report'
+
+
 def test_ai_openai_reads_api_key_file(monkeypatch: pytest.MonkeyPatch, job_state: JobState, tmp_path: Path) -> None:
     key_file = tmp_path / 'api-key'
     key_file.write_text('file-key\n')
