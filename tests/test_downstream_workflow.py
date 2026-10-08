@@ -56,6 +56,9 @@ class DownstreamWorkflowTest(unittest.TestCase):
                 return subprocess.check_output(['git', '-c', 'commit.gpgSign=false', *args], cwd=root, env=env, text=True).strip()
             git('init', '-q')
             (root / 'README.rst').write_text('Upstream README\n')
+            (root / 'pyproject.toml').write_text("readme = { file = 'README.rst', content-type = 'text/x-rst' }\n")
+            (root / 'docs').mkdir()
+            (root / 'docs/index.rst').write_text('.. include:: ../README.rst\n')
             (root / 'value').write_text('before\n')
             git('add', '.')
             git('commit', '-qm', 'base')
@@ -97,15 +100,18 @@ class DownstreamWorkflowTest(unittest.TestCase):
         self.assertEqual(first, second)
         files = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', first], text=True).splitlines()
         self.assertFalse(any(name.startswith(('.github/workflows/', 'patches/')) for name in files))
-        readme = subprocess.check_output(['git', 'show', f'{first}:README.rst'], text=True)
-        self.assertTrue(readme.startswith('This fork follows upstream `webchanges'))
+        readme = subprocess.check_output(['git', 'show', f'{first}:README.md'], text=True)
+        self.assertTrue(readme.startswith('This fork follows upstream [webchanges'))
+        self.assertEqual([name for name in files if '/' not in name and name.startswith('README')], ['README.md'])
         self.assertIn('Patched webchanges', readme)
         self.assertIn('https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/', readme)
         upstream_readme = subprocess.check_output(['git', 'show', 'upstream/main:README.rst'], text=True)
-        self.assertEqual(readme.split('\n----\n\n', 1)[1], upstream_readme)
+        converted = subprocess.check_output(['pandoc', '-f', 'rst', '-t', 'gfm', '--wrap=none'], input=upstream_readme, text=True)
+        self.assertEqual(readme.split('\n' + '-' * 72 + '\n\n', 1)[1], converted)
+        self.assertEqual(subprocess.check_output(['git', 'show', f'{first}:docs/upstream-readme.rst'], text=True), upstream_readme)
         names = Path('patches/series').read_text().splitlines()
         for index, name in enumerate(names, 1):
-            self.assertIn(f'{index}. `{name} <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/{name}>`__', readme)
+            self.assertIn(f'{index}.  [{name}](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/{name})', readme)
 
 
 if __name__ == '__main__':

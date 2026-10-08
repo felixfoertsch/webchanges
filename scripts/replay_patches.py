@@ -60,6 +60,7 @@ def replay(base: str, output: Path | None) -> str:
         shutil.rmtree(directory / ".github" / "workflows", ignore_errors=True)
         shutil.rmtree(directory / "patches", ignore_errors=True)
         readme = directory / "README.rst"
+        upstream_readme = readme.read_text()
         readme.write_text(
             "This fork follows upstream `webchanges <https://github.com/mborsetti/webchanges>`__ with ordered patches "
             + ", ".join(f"`{patch.name[:4]} <https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/{patch.name}>`__" for patch in series())
@@ -70,6 +71,17 @@ def replay(base: str, output: Path | None) -> str:
             + "\n\n----\n\n"
             + readme.read_text()
         )
+        header = readme.read_text().split("\n----\n\n", 1)[0]
+        def markdown(text: str) -> str:
+            return subprocess.check_output(["pandoc", "-f", "rst", "-t", "gfm", "--wrap=none"], input=text, text=True)
+        (directory / "README.md").write_text(markdown(header) + "\n" + "-" * 72 + "\n\n" + markdown(upstream_readme))
+        readme.unlink()
+        metadata = directory / "pyproject.toml"
+        metadata.write_text(metadata.read_text().replace("file = 'README.rst', content-type = 'text/x-rst'", "file = 'README.md', content-type = 'text/markdown'"))
+        # Sphinx still consumes the exact upstream RST, outside the root README namespace.
+        (directory / "docs" / "upstream-readme.rst").write_text(upstream_readme)
+        index = directory / "docs" / "index.rst"
+        index.write_text(index.read_text().replace("../README.rst", "upstream-readme.rst"))
         git("add", "-A", cwd=directory)
         changed = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=directory).returncode != 0
         if changed:

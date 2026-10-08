@@ -11,6 +11,10 @@ concurrency:
   group: downstream-builds
   cancel-in-progress: false
 
+# GitHub actions run on Node.js 24; application/build targets stay Python.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: read
 
@@ -30,6 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with: {ref: '${{ github.sha }}', fetch-depth: 0, persist-credentials: false}
+      - uses: jdx/mise-action@v3
       - id: refs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -56,6 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with: {ref: '${{ github.sha }}', fetch-depth: 0, persist-credentials: false}
+      - uses: jdx/mise-action@v3
       - uses: actions/setup-python@v6
         with: {python-version: '3.14'}
       - name: Build isolated candidate
@@ -101,6 +107,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with: {ref: '${{ github.sha }}', fetch-depth: 0, persist-credentials: false}
+      - uses: jdx/mise-action@v3
       - uses: actions/download-artifact@v4
         with: {name: candidate-stable, path: '${{ runner.temp }}/candidate-stable'}
       - uses: actions/download-artifact@v4
