@@ -108,6 +108,7 @@ AiOpenAIDirectives = TypedDict(
     {
         'api_url': str,
         'api_key_env': str,
+        'api_key_file': str,
         'model': str,
         'models': list[str],
         'timeout': int,
@@ -2279,6 +2280,7 @@ class AIOpenAIDiffer(AIGoogleDiffer):
     __supported_directives__: dict[str, str] = {
         'api_url': 'chat completions API URL (default: http://127.0.0.1:20128/v1/chat/completions)',
         'api_key_env': 'environment variable containing API key (default: OPENAI_API_KEY)',
+        'api_key_file': 'file containing API key (takes precedence over api_key_env)',
         'model': 'model name (default: gpt-4o-mini)',
         'models': 'model names to try sequentially when model is not set',
         'system_instructions': 'optional tone and style instructions for model',
@@ -2304,7 +2306,11 @@ class AIOpenAIDiffer(AIGoogleDiffer):
         if directives is None:
             directives = {}
         api_key_env = directives.get('api_key_env', 'OPENAI_API_KEY')
-        api_key = os.environ.get(api_key_env, '').rstrip()
+        api_key_file = directives.get('api_key_file')
+        try:
+            api_key = Path(api_key_file).read_text().rstrip() if api_key_file else os.environ.get(api_key_env, '').rstrip()
+        except OSError:
+            api_key = ''
         if not api_key:
             logger.error(f'Job {job.index_number}: Environment variable {api_key_env} not found ({job.get_location()})')
             return f'## ERROR in summarizing changes using OpenAI-compatible AI:\nEnvironment variable {api_key_env} not found.', ''

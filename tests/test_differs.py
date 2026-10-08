@@ -1329,6 +1329,30 @@ def test_ai_openai_uses_first_successful_model_and_parses_done(monkeypatch: pyte
     assert request_data[1]['messages'][0] == {'role': 'system', 'content': 'Be terse.'}
 
 
+def test_ai_openai_reads_api_key_file(monkeypatch: pytest.MonkeyPatch, job_state: JobState, tmp_path: Path) -> None:
+    key_file = tmp_path / 'api-key'
+    key_file.write_text('file-key\n')
+    request_headers: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_headers.append(request.headers)
+        return httpx.Response(200, json={'choices': [{'message': {'content': 'Changed.'}}]}, request=request)
+
+    client = httpx.Client
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+    monkeypatch.setattr(
+        differs.httpx,
+        'Client',
+        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    job_state.old_data = 'old\n'
+    job_state.new_data = 'new\n'
+    job_state.job.differ = {'name': 'ai_openai', 'api_key_file': str(key_file)}
+
+    assert job_state.get_diff().startswith('Changed.')
+    assert request_headers[0]['authorization'] == 'Bearer file-key'
+
+
 def test_ai_openai_requires_api_key(monkeypatch: pytest.MonkeyPatch, job_state: JobState) -> None:
     monkeypatch.delenv('OPENAI_API_KEY', raising=False)
     job_state.old_data = 'old\n'
