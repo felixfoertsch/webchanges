@@ -12,7 +12,10 @@ from pathlib import Path
 def assets(release: dict, expected: set[str]) -> dict[str, str]:
     found = {asset["name"]: asset.get("digest", "").removeprefix("sha256:") for asset in release["assets"]}
     unknown = set(found) - expected
-    if unknown or any(len(found.get(name, "")) != 64 for name in found):
+    if len(found) != len(release["assets"]) or unknown or any(
+        len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)
+        for digest in found.values()
+    ):
         raise ValueError("unexpected or unhashed release asset")
     return found
 
@@ -23,6 +26,7 @@ def main() -> int:
     parser.add_argument("--commit", required=True)
     parser.add_argument("--asset", action="append", required=True)
     parser.add_argument("--dist", type=Path)
+    parser.add_argument("--provenance", type=Path)
     parser.add_argument("--require-complete", action="store_true")
     args = parser.parse_args()
     release = json.loads(args.release.read_text())
@@ -31,6 +35,8 @@ def main() -> int:
     found = assets(release, set(args.asset))
     if args.dist:
         local = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in args.dist.iterdir()}
+        if args.provenance:
+            local[args.provenance.name] = hashlib.sha256(args.provenance.read_bytes()).hexdigest()
         if any(local.get(name) != digest for name, digest in found.items()):
             raise SystemExit("release asset digest differs")
     if release["draft"] and not args.require_complete:

@@ -92,6 +92,11 @@ class DownstreamWorkflowTest(unittest.TestCase):
         self.assertEqual(module.select_tag('v3.37.0', 'stable', 'aaa', refs, '2026.10.08'), 'v3.37.0-2026.10.08.1')
         self.assertEqual(module.select_tag('v3.37.0', 'stable', 'ccc', refs, '2026.10.08'), 'v3.37.0-2026.10.08.3')
         self.assertEqual(module.select_tag('v3.37.0', 'nightly', 'aaa', refs, '2026.10.08'), 'nightly-v3.37.0-2026.10.08.1')
+        self.assertEqual(module.select_tag('v3.37.0', 'stable', 'aaa', refs, '2026.10.09'), 'v3.37.0-2026.10.08.1')
+        nightly = 'aaa refs/tags/nightly-v3.37.0-2026.10.08.1'
+        self.assertEqual(module.select_tag('v3.37.0', 'nightly', 'aaa', nightly, '2026.10.09'), 'nightly-v3.37.0-2026.10.08.1')
+        self.assertEqual(module.select_tag('v3.37.0', 'stable', 'ccc', refs, '2026.10.09'), 'v3.37.0-2026.10.09.1')
+        self.assertEqual(module.select_tag('v3.37.0', 'stable', 'aaa', refs, '2026.10.09', force=True), 'v3.37.0-2026.10.09.1')
 
     def test_replay_is_deterministic_and_has_patch_list(self):
         command = ['python3', 'scripts/replay_patches.py', '--base', 'upstream/main']

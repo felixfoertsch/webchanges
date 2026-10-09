@@ -6,6 +6,11 @@ on:
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Create new immutable release identities even for unchanged source
+        type: boolean
+        default: false
 
 concurrency:
   group: downstream-builds
@@ -38,6 +43,7 @@ jobs:
       - id: refs
         env:
           GH_TOKEN: ${{ github.token }}
+          REBUILD: ${{ inputs.rebuild || false }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -48,8 +54,9 @@ jobs:
           stable_commit=$(python3 scripts/replay_patches.py --base "$stable_upstream")
           nightly_commit=$(python3 scripts/replay_patches.py --base "$upstream_main")
           git ls-remote --tags --refs origin > "$RUNNER_TEMP/tags"
-          stable_tag=$(python3 scripts/release_tag.py --upstream "$stable_base" --channel stable --commit "$stable_commit" < "$RUNNER_TEMP/tags")
-          nightly_tag=$(python3 scripts/release_tag.py --upstream "$stable_base" --channel nightly --commit "$nightly_commit" < "$RUNNER_TEMP/tags")
+          flags=(); [ "$REBUILD" != true ] || flags+=(--force)
+          stable_tag=$(python3 scripts/release_tag.py --upstream "$stable_base" --channel stable --commit "$stable_commit" "${flags[@]}" < "$RUNNER_TEMP/tags")
+          nightly_tag=$(python3 scripts/release_tag.py --upstream "$stable_base" --channel nightly --commit "$nightly_commit" "${flags[@]}" < "$RUNNER_TEMP/tags")
           printf 'upstream_main=%s\nstable_base=%s\nstable_upstream=%s\nstable_commit=%s\nstable_tag=%s\nnightly_commit=%s\nnightly_tag=%s\nmain_lease=%s\n' "$upstream_main" "$stable_base" "$stable_upstream" "$stable_commit" "$stable_tag" "$nightly_commit" "$nightly_tag" "$main_lease" >> "$GITHUB_OUTPUT"
 
   build:
@@ -137,7 +144,7 @@ jobs:
             jq -s --arg tag "$tag" 'map(select(.tag_name == $tag)) | if length > 1 then error("duplicate release") else .[0] // empty end' "$RUNNER_TEMP/releases" > "$candidate/release.json"
             if [ -s "$candidate/release.json" ]; then
               assets=("$candidate"/dist/*)
-              python3 scripts/release_state.py "$candidate/release.json" --commit "$commit" --asset "$(basename "${assets[0]}")" --asset "$(basename "${assets[1]}")" --dist "$candidate/dist"
+              python3 scripts/release_state.py "$candidate/release.json" --commit "$commit" --asset "$(basename "${assets[0]}")" --asset "$(basename "${assets[1]}")" --asset provenance.json --dist "$candidate/dist" --provenance "$candidate/provenance.json"
             fi
           done
       - name: Promote validated source and immutable releases
@@ -179,15 +186,25 @@ jobs:
             if [ ! -s "$candidate/release.json" ]; then
               gh api --method POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$tag" -f target_commitish="$commit" -f name="webchanges $tag" -F draft=true > "$candidate/release.json"
             fi
-            state=$(python3 scripts/release_state.py "$candidate/release.json" --commit "$commit" --asset "$(basename "${assets[0]}")" --asset "$(basename "${assets[1]}")" --dist "$candidate/dist")
-            if [ "$state" = complete ]; then continue; fi
-            for asset in "${assets[@]}"; do
+            state=$(python3 scripts/release_state.py "$candidate/release.json" --commit "$commit" --asset "$(basename "${assets[0]}")" --asset "$(basename "${assets[1]}")" --asset provenance.json --dist "$candidate/dist" --provenance "$candidate/provenance.json")
+            if [ "$state" = complete ]; then
+              freshness
+              if [ "$channel" = stable ]; then
+                gh release edit "$tag" --latest
+                test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" = "$tag"
+              else
+                gh release edit "$tag" --prerelease --latest=false
+              fi
+              continue
+            fi
+            for asset in "${assets[@]}" "$candidate/provenance.json"; do
               if ! jq -e --arg name "$(basename "$asset")" '.assets[] | select(.name == $name)' "$candidate/release.json" >/dev/null; then gh release upload "$tag" "$asset"; fi
             done
             release_id=$(jq -er .id "$candidate/release.json")
             gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$candidate/release.json"
-            python3 scripts/release_state.py "$candidate/release.json" --commit "$commit" --asset "$(basename "${assets[0]}")" --asset "$(basename "${assets[1]}")" --dist "$candidate/dist" --require-complete
+            python3 scripts/release_state.py "$candidate/release.json" --commit "$commit" --asset "$(basename "${assets[0]}")" --asset "$(basename "${assets[1]}")" --asset provenance.json --dist "$candidate/dist" --provenance "$candidate/provenance.json" --require-complete
             freshness
-            flags=(); [ "$channel" != nightly ] || flags+=(--prerelease --latest=false)
+            flags=(--latest); [ "$channel" != nightly ] || flags=(--prerelease --latest=false)
             gh release edit "$tag" --draft=false "${flags[@]}"
+            if [ "$channel" = stable ]; then test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" = "$tag"; fi
           done
