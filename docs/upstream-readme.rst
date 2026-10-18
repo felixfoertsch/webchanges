@@ -111,24 +111,6 @@ Schedule
   <https://launchd.info/>`__).
 
 
-Downstream patches
-==================
-
-Generated branches replay these patches, in order, on upstream ``main`` or latest upstream release tag:
-
-.. code-block:: text
-
-   0001-add-OpenAI-compatible-AI-differ.patch
-   0002-support-file-backed-AI-API-keys.patch
-   0003-support-quiet-AI-change-filtering.patch
-   0004-add-compact-HTML-change-digests.patch
-   0005-suppress-AI-failures-from-change-reports.patch
-   0006-add-OpenAI-email-integration-coverage.patch
-   0007-show-actionable-fetch-errors-after-digest-content.patch
-   0008-support-streamed-newsletter-summaries-reject-silent-.patch
-   0009-accept-explicit-stop-completion-in-model-streams.patch
-   0010-forward-reasoning-effort-to-OpenAI-compatible-models.patch
-
 Code
 ====
 |coveralls| |issues| |code_style| |OpenSSF_Scorecard|
