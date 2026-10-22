@@ -62,7 +62,12 @@ class ReleaseStateTest(unittest.TestCase):
             self.assertEqual(check().stdout.strip(), 'partial')
             release['assets'].append(removed)
             release['assets'][0]['digest'] = 'sha256:' + '0' * 64
-            self.assertNotEqual(check().returncode, 0)
+            mismatch = check()
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn('webchanges.whl', mismatch.stderr)
+            self.assertIn('new release identity', mismatch.stderr)
+            self.assertIn('rebuild=true', mismatch.stderr)
+            self.assertEqual(files[0].read_bytes(), b'webchanges.whl')
             release['assets'][0]['digest'] = 'sha256:' + hashlib.sha256(files[0].read_bytes()).hexdigest()
             provenance.write_text('{"commit": "tampered"}\n')
             self.assertNotEqual(check().returncode, 0)

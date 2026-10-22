@@ -42,7 +42,7 @@ def series() -> list[Path]:
 CONTROL_PATHS = (
     '.github/workflows/downstream.yml', '.mise.toml',
     'scripts/replay_patches.py', 'scripts/refresh_control.py', 'scripts/control-refresh.md',
-    'scripts/normalize_sdist.py', 'scripts/package_candidate.py',
+    'scripts/normalize_sdist.py', 'scripts/package_candidate.py', 'scripts/build-requirements.txt',
     'scripts/release_state.py', 'scripts/release_tag.py',
     'tests/test_downstream_workflow.py', 'tests/test_control_refresh.py',
     'tests/test_normalize_sdist.py', 'tests/test_package_candidate.py', 'tests/test_release_state.py',

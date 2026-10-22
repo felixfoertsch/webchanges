@@ -37,8 +37,12 @@ def main() -> int:
         local = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in args.dist.iterdir()}
         if args.provenance:
             local[args.provenance.name] = hashlib.sha256(args.provenance.read_bytes()).hexdigest()
-        if any(local.get(name) != digest for name, digest in found.items()):
-            raise SystemExit("release asset digest differs")
+        mismatches = [name for name, digest in found.items() if local.get(name) != digest]
+        if mismatches:
+            raise SystemExit(
+                'release asset digest differs: ' + ', '.join(sorted(mismatches))
+                + '; preserve published bytes; new build inputs require a new release identity (dispatch rebuild=true)'
+            )
     if release["draft"] and not args.require_complete:
         print("partial")
         return 0

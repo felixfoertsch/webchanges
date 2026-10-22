@@ -13,6 +13,13 @@ additional diff, not the historical patch author's original commit. Other seven
 patches remain byte-identical. Published tags and assets retain original source.
 New reconstructed source needs new release identities.
 
+Package-byte inputs are pinned in `scripts/build-requirements.txt` and the workflow's
+Python version. Builds retain commit-derived `SOURCE_DATE_EPOCH` and normalized
+sdist metadata. Pin or generator changes require new identities: dispatch with
+`rebuild=true`, never replace existing tags or asset bytes. A mismatched existing
+identity fails closed and names the differing assets; draft retries also reject
+mismatched bytes. Ordinary unchanged retries still verify complete matching assets.
+
 Refresh builds candidates without write credentials. Old-control code separately
 reconstructs before promotion, restores the downloaded self-contained backup into
 an empty repository, checks workflow tree identity, rechecks remote selection and

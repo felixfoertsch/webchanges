@@ -32,6 +32,21 @@ class DownstreamWorkflowTest(unittest.TestCase):
         self.assertIn('gh api "repos/$GITHUB_REPOSITORY/releases/$release_id"', publish)
         self.assertLess(publish.index('Reconstruct and validate both candidates'), publish.index('push origin'))
 
+    def test_package_build_inputs_are_pinned(self):
+        import re
+        workflow = Path('.github/workflows/downstream.yml').read_text()
+        self.assertIn("python-version: '3.14.8'", workflow)
+        self.assertIn('python -m pip install -r scripts/build-requirements.txt', workflow)
+        self.assertIn('export PIP_BUILD_CONSTRAINT="$PIP_CONSTRAINT"', workflow)
+        self.assertIn('python -m build --no-isolation "$source"', workflow)
+        self.assertIn('export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$COMMIT")', workflow)
+        pins = Path('scripts/build-requirements.txt').read_text().splitlines()
+        self.assertTrue(all(re.fullmatch(r'[A-Za-z0-9_-]+==[0-9]+(?:\.[0-9]+)+', line)
+                            for line in pins if line and not line.startswith('#')))
+        self.assertIn('setuptools==84.0.0', pins)
+        from scripts.replay_patches import CONTROL_PATHS
+        self.assertIn('scripts/build-requirements.txt', CONTROL_PATHS)
+
     def test_no_inherited_publication(self):
         for path in Path('.github/workflows').iterdir():
             if path.name == 'downstream.yml':

@@ -143,7 +143,7 @@ jobs:
         with: {ref: '${{ github.sha }}', fetch-depth: 0, persist-credentials: false}
       - uses: jdx/mise-action@v3
       - uses: actions/setup-python@v6
-        with: {python-version: '3.14'}
+        with: {python-version: '3.14.8'}
       - name: Build isolated candidate
         env:
           CHANNEL: ${{ matrix.channel }}
@@ -155,7 +155,10 @@ jobs:
           git fetch --no-tags https://github.com/mborsetti/webchanges.git +refs/heads/main:refs/remotes/upstream/main '+refs/tags/*:refs/tags/upstream/*'
           source="$RUNNER_TEMP/source"
           test "$(python3 scripts/replay_patches.py --base "$BASE" --output "$source")" = "$COMMIT"
-          python -m pip install build
+          python -m pip install -r scripts/build-requirements.txt
+          # Constrain PEP 517 subprocesses too, including the test installation.
+          export PIP_CONSTRAINT="$GITHUB_WORKSPACE/scripts/build-requirements.txt"
+          export PIP_BUILD_CONSTRAINT="$PIP_CONSTRAINT"
           python - "$source" "$TAG" <<'PY'
           import sys, re
           from pathlib import Path
@@ -167,7 +170,7 @@ jobs:
           export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$COMMIT")
           python -m pip install "$source" -r "$source/tests/requirements_pytest.txt"
           (cd "$source" && python -m pytest tests/test_differs.py tests/test_reporters.py tests/test_newsletter_failures.py -q -k 'not test_mailer_send')
-          python -m build "$source"
+          python -m build --no-isolation "$source"
           python scripts/normalize_sdist.py "$source"/dist/*.tar.gz "$SOURCE_DATE_EPOCH"
           mkdir "$RUNNER_TEMP/candidate"
           mv "$source/dist" "$RUNNER_TEMP/candidate/dist"

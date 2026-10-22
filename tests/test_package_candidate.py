@@ -31,6 +31,28 @@ class CandidateTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 candidate.describe(root, expected.replace('stable', 'nightly'))
 
+    @unittest.skipUnless(importlib.util.find_spec('build'), 'requires scripts/build-requirements.txt')
+    def test_pinned_backend_rebuild_is_byte_identical(self):
+        import os
+        import subprocess
+        import sys
+        from scripts.normalize_sdist import normalize
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'webchanges.py').write_text('__version__ = "1.0"\n')
+            (root / 'pyproject.toml').write_text(
+                '[build-system]\nrequires = ["setuptools"]\nbuild-backend = "setuptools.build_meta"\n'
+                '[project]\nname = "webchanges"\nversion = "1.0"\n')
+            results = []
+            for mtime in (1700000000, 1800000000):
+                os.utime(root / 'webchanges.py', (mtime, mtime))
+                subprocess.run([sys.executable, '-m', 'build', '--no-isolation', str(root)],
+                               env={**os.environ, 'SOURCE_DATE_EPOCH': '1600000000'},
+                               capture_output=True, check=True)
+                normalize(root / 'dist/webchanges-1.0.tar.gz', 1600000000)
+                results.append(candidate.describe(root / 'dist', '1.0'))
+            self.assertEqual(results[0], results[1])
+
     def test_version_is_channel_specific(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); (root / 'webchanges').mkdir()
