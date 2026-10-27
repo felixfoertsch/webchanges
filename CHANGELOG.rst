@@ -35,6 +35,236 @@ can check out the `wish list <https://github.com/mborsetti/webchanges/blob/main/
    Internals, for changes that don't affect users. [triggers a minor patch]
 
 
+Version 3.39.0
+-------------------
+2026-10-26
+
+Added
+`````
+* Command line arguments that take a job (a joblist, ``--test``, ``--test-differ``, ``--dump-history``,
+  ``--delete``, ``--delete-snapshot``, ``--change-location`` etc.) also select it by its ``name``. See :ref:`here
+  <job_subset>`.
+* New ``ignore_incomplete_reads`` job directive for ``url`` jobs: ignores the error raised when the server closes the
+  connection before sending the complete response. See :ref:`here <ignore_incomplete_reads>`.
+* New ``reply_to`` sub-directive of the ``email`` reporter, setting the ``Reply-To`` header of the email.
+* New ``--enable`` and ``--disable`` command line arguments, which set a job's ``enabled`` directive.
+  They rewrite the jobs file, so all its remarks are lost. See :ref:`here <enable_disable>`.
+* New ``stderr`` directive for ``command`` jobs: ``ignore`` (the default), ``forward``,
+  ``fail`` and ``stdout`` to handle the command's standard error output. See :ref:`here <stderr>`.
+* New ``treat_new_as_changed`` job directive (for backward compatibility): reports a new job as changed, with its
+  content shown as a diff from empty content, so that its differ and ``diff_filters`` apply from the first run. See
+  :ref:`here <treat_new_as_changed>`.
+* Better backward compatibility: the legacy ``useragent``, ``browser`` and ``wait_for`` directives of ``navigate``
+  jobs are translated into a ``User-Agent`` header, ``use_browser`` and ``wait_for_selector`` (``wait_for`` used to
+  fail the job), and the legacy ``mattermost`` reporter runs as a ``webhook`` one with Markdown; all print a
+  deprecation warning. See :ref:`here <upgrading>`.
+
+Changed
+```````
+* A job selected by URL/command (or name) that matches more than one job is now an error listing the jobs matched,
+  instead of silently selecting the first one; select the job by its index number instead.
+* The ``html2text`` filter's ``lynx`` method (for backward compatibility) no longer fails the job: it runs the default
+  method instead (ignoring ``lynx``'s options) and prints a deprecation warning.
+
+Fixed
+`````
+* A job selected more than once in a joblist (e.g. a new job selected with ``--prepare-jobs``, which also adds the new
+  jobs) ran more than once.
+* The debug log reported a negative number of disabled jobs.
+* The ``ntfy`` reporter published only the first job of a report, raising ``RuntimeError: Cannot reopen a client
+  instance, once it has been closed.`` on the second one (or a ``NameError`` if ``httpx`` is not installed). A failed
+  publication no longer prevents the other jobs from being published.
+* The ``ntfy`` reporter no longer adds an "Open URL" action to the messages of ``command`` jobs.
+* With the same ``RuntimeError``, the ``ifttt`` reporter sent only the first job of a report, and the ``webhook`` (as
+  well as the deprecated ``slack`` and ``mattermost``) and ``discord`` reporters only the first part of a report too
+  long for one message.
+* On the first run, legacy jobs, configuration and hooks files are now also found and copied from the legacy
+  platform-specific configuration directory (e.g. ``~/.config/urlwatch`` on Linux), and not only from
+  ``~/.urlwatch``.
+* The deprecated ``shell`` reporter (for backward compatibility) crashed with ``KeyError: 'max_message_length'``; it now
+  pipes the report to its command's standard input.
+* The deprecated ``slack`` reporter (for backward compatibility) was silently ignored; it now runs as a ``webhook``
+  reporter.
+* The ``run_command`` reporter did not set the documented ``WEBCHANGES_CHANGED_JOBS_JSON`` environment variable; it
+  now holds the directives of the jobs reported on.
+* The subject (or title) of a report with a single change read "1 changes" instead of "1 change".
+* Jobs with the deprecated ``navigate`` directive failed when run with "Directive 'navigate' is deprecated with
+  Playwright", although the directive was translated into ``url`` and ``use_browser: true``.
+* Rewriting the jobs file (with ``--add``, ``--delete`` or ``--change-location``) dropped the directives set to false
+  or 0, such as ``enabled: false`` or ``contextlines: 0``.
+* ``--delete`` and ``--change-location`` crashed with ``EOFError`` at their confirmation prompt when no input was
+  available (e.g. ``--change-location`` run by ``cron``, or standard input redirected from the null device, which
+  Windows reports as a terminal); they now leave the jobs file unmodified.
+
+
+Version 3.38.0
+-------------------
+2026-10-25
+
+⚠ Breaking Changes
+``````````````````
+* Removed support for Python 3.11. Reminder: older Python versions are supported for 3 years after being obsoleted by
+  a new major release; as Python 3.13 was released on 7 October 2024, support for Python 3.12 will be removed on or
+  after 7 October 2027.
+* Retired the ``empty_as_transient`` job directive, introduced in version 3.37.0, in favor of the new and more
+  extensive ``empty_as_error`` which is more descriptive (see below). See :ref:`here <empty_as_error>`.
+
+Added
+`````
+* Support for Python 3.15, including its free-threaded build 3.15t (some optional dependencies may not support either
+  yet; the ``deepdiff`` extras install ``deepdiff`` 8.x there). On Windows, installing on Python 3.15 requires an extra
+  step; see :ref:`here <install_windows>`.
+* New ``empty_as_error`` job directive: treats an empty response or output, or one that the filters leave empty, as a
+  transient error, so that a flaky site or command no longer reports its content disappearing and then reappearing.
+  Suggested by `Marcos Alano <https://github.com/mhalano>`__ in `#169
+  <https://github.com/mborsetti/webchanges/issues/169>`__ and `#195
+  <https://github.com/mborsetti/webchanges/issues/195>`__. See :ref:`here <empty_as_error>`.
+* New ``tags`` job directive and ``--tags`` command line argument: group jobs, and run only those having any of the
+  tags listed (e.g. ``webchanges --tags personal,team``). See :ref:`here <tags>` and :ref:`here <tags_cli>`.
+* A reporter can now be configured more than once and, with the new ``tags`` reporter directive, be restricted to the
+  jobs having certain tags, e.g. to send different jobs to different email addresses. See :ref:`here
+  <multiple_reporters>` and :ref:`here <reporter_tags>`.
+* New ``!env`` YAML tag: inserts environment variables (``${VAR}`` or ``${VAR:-default}``) into any string value of
+  the jobs and configuration files, e.g. to keep secrets out of them. Suggested by `Marcos Alano
+  <https://github.com/mhalano>`__ in `#99 <https://github.com/mborsetti/webchanges/issues/99>`__. See :ref:`here
+  <environment_variables>`.
+* New ``jobs`` and ``hooks`` configuration directives: set the jobs and hooks files to use instead of the default ones,
+  so that ``--jobs`` and ``--hooks`` no longer need to be typed at every run. Requested by `drws
+  <https://github.com/drws>`__ in `#174 <https://github.com/mborsetti/webchanges/issues/174>`__. See :ref:`here
+  <config_jobs>`.
+* The ``--jobs`` and ``--hooks`` command line arguments now also accept a directory, standing for all the ``*.yaml``
+  or ``*.py`` files in its tree. See :ref:`here <cli_jobs>`.
+* New ``xmltojson`` and ``xmltoyaml`` filters: convert XML (e.g. an API response or a feed) to JSON or YAML, so that
+  changes are reported as readable keys and values. See :ref:`here <xmltojson>` and :ref:`here <xmltoyaml>`.
+* New ``markdown_extras`` job directive: sets the extras of the ``markdown2`` library used to render Markdown as HTML
+  in reports. See :ref:`here <markdown_extras>`.
+* The ``html2text`` filter now decodes HTML returned inside a JSON string, so that its Unicode escape sequences are no
+  longer reported verbatim. See :ref:`here <html2text>`.
+* New ``hook_data`` job directive: passes any data from a job to the custom Classes in ``hooks.py`` that it uses, so
+  that one Class can serve many jobs. See :ref:`here <hook_data>`.
+* New ``compact`` sub-directive of the ``format-json`` filter: removes all unnecessary whitespace. See :ref:`here
+  <format-json>`.
+
+Changed
+```````
+* Markdown emphasis markers within a word are no longer rendered as emphasis in HTML reports: ``snake_case_name`` is
+  now shown as written. To reinstate it, use the new ``markdown_extras`` job directive with ``middle-word-em: true``.
+  See :ref:`here <markdown_extras>`.
+* The error reported when an optional package cannot be imported is now the same everywhere: it names what needs the
+  package and the command to install it (e.g. ``uv pip install --upgrade webchanges[pdf2text]``). The ``email`` and
+  ``xmpp`` reporters now report a missing ``keyring`` package as such, instead of as a missing password. See
+  :ref:`here <optional_packages>`.
+* The ``jq`` filter is now also available on Windows. See :ref:`here <jq>`.
+* On Windows, the ``stdout`` reporter now displays colors natively, and ``colorama`` is no longer a requirement.
+* ``css`` and ``xpath`` filters: ``selector`` and ``path`` respectively are no longer required when ``exclude`` is
+  specified, which then removes elements from the whole document. See :ref:`here <css>` and :ref:`here <xpath>`.
+* ``ai_google`` differ: the summary of a transient API error (HTTP 429 or 503) that persists now states how many
+  retries were made and for how long. See :ref:`here <ai_google_diff>`.
+* The sub-directives of ``job_defaults`` in the configuration file are renamed after the job kind they apply to, so
+  that they can no longer be mistaken for the job directives of the same name: ``all_jobs``, ``url_jobs``,
+  ``browser_jobs`` and ``command_jobs``. The previous ``all``, ``url``, ``browser`` and ``command`` (and the older
+  ``shell``) continue to work unchanged. Suggested by `drws <https://github.com/drws>`__ in `#173
+  <https://github.com/mborsetti/webchanges/issues/173>`__. See :ref:`here <job_defaults>`.
+* A header or cookie set to null (no value) in the ``headers`` or ``cookies`` directive of a job, or of ``url_jobs`` or
+  ``browser_jobs`` in ``job_defaults``, now removes the one of the same name set in ``job_defaults``, which is then not
+  sent; previously, it was sent with the value ``None``. See :ref:`here <headers>` and :ref:`here <cookies>`.
+
+Deprecated
+``````````
+* The ``remove-duplicate-lines`` filter, inherited from :program:`urlwatch`: use ``remove_repeated`` with
+  ``adjacent: false``, which does the same. See :ref:`here <remove_repeated>`.
+* The ``title`` sub-directive of the ``gotify`` reporter: use ``subject`` (see Fixed, below). See :ref:`here
+  <gotify>`.
+
+Fixed
+`````
+* The ``retries`` job directive, introduced in version 3.13, had no effect. It now retries connection errors, timeouts
+  and transient HTTP errors, waiting as requested by the server or with an exponential backoff. Reported by `101Dude
+  <https://github.com/101Dude>`__ in `#196 <https://github.com/mborsetti/webchanges/issues/196>`__. See :ref:`here
+  <retries>`.
+* The ``ignore_dh_key_too_small`` job directive made every HTTPS request fail with ``http_client: httpx`` (the
+  default), and had no effect with ``http_client: requests`` and version 2 of ``urllib3``. See :ref:`here
+  <ignore_dh_key_too_small>`.
+* On Linux and macOS, :program:`webchanges` could be killed without reporting any error (exit code 141) when a server
+  closed the connection, e.g. while sending an ``email`` report.
+* An HTTP 304 (Not Modified) response received in the run following a failed one overwrote the snapshot with empty
+  data, causing a spurious change report at the next run (only servers replying 304 to unconditional requests were
+  affected).
+* ``--rollback-database`` deleted the snapshots before asking for confirmation, regardless of the answer, and displayed
+  a wrong count; it also rejected Unix timestamps with a fractional part. See :ref:`here <rollback-database>`.
+* With multiple jobs files, ``--add``, ``--delete`` and ``--change-location`` saved all the jobs into the first file,
+  duplicating those of the other files. They now ask to select a single file with ``--jobs``. See :ref:`here
+  <cli_jobs>`.
+* A ``headers`` directive set in ``job_defaults`` for one job kind leaked into jobs of other kinds. See :ref:`here
+  <job_defaults>`.
+* With multiple jobs files, the order in which they were combined, and with it the jobs' index numbers, could change
+  from run to run. See :ref:`here <cli_jobs>`.
+* The ``email`` reporter (``smtp`` method) and ``--smtp-login`` waited forever for an unresponsive server (they now
+  time out after 60 seconds), and could fail with ``STARTTLS extension not supported by server`` when the computer's
+  own hostname was slow to look up. See :ref:`here <smtp>`.
+* ``use_browser: true`` jobs: a proxy without credentials was sent with the username and password ``None``, and one
+  without a port was ignored; credentials are now also percent-decoded. See :ref:`here <proxy>`.
+* Without ``httpx`` installed, ``http_client: httpx``, the ``image`` differ and the AI summaries failed with an obscure
+  ``AttributeError``: the ``image`` differ now falls back to ``requests`` or ``curl_cffi``, and the others report that
+  they require ``httpx``. See :ref:`here <http_client>`.
+* Reports of transient HTTP errors in ``url`` jobs (without ``use_browser: true``) and ``command`` jobs contained a
+  full Python traceback instead of just the error message.
+* ``use_browser: true`` jobs: ``ignore_http_error_codes`` did not suppress transient HTTP errors (status codes 429,
+  500, 502, 503, 504 and the synthetic 999). See :ref:`here <ignore_http_error_codes>`.
+* A job with both the ``url`` and ``command`` directives, which are mutually exclusive, is now rejected instead of
+  being run as a ``command`` job.
+* The ``remove_repeated`` filter with ``adjacent: true`` (the default) removed a line contained within the preceding
+  one when it had also appeared earlier. See :ref:`here <remove_repeated>`.
+* The ``gotify`` reporter flagged its documented ``subject`` sub-directive as unrecognized, while ignoring the
+  ``title`` one in the default configuration. See :ref:`here <gotify>`.
+* The bundled JSON Schemas, used by editors to validate and autocomplete the jobs and configuration files, flagged
+  valid files as invalid (e.g. filters without sub-directives or with their default sub-directive given directly,
+  some job directives, and reporters missing a sub-directive) and offered job directives that do not exist.
+* The ``xmpp`` reporter raised an ``AttributeError`` when the ``keyring`` package is not installed and no
+  ``insecure_password`` is set. See :ref:`here <xmpp>`.
+* ``--detailed-versions`` crashed when Playwright is installed but ``psutil`` is not.
+* The deprecation warning of the ``striplines`` filter named it ``strip_each_line``.
+* With ``max_tries``, the first error reported was flagged as a repeated one, so that with ``suppress_repeated_errors:
+  true`` it was never reported (yet its end was). See :ref:`here <max_tries>`.
+* A job whose first run(s) failed was reported as changed (from no data) instead of new when it first succeeded.
+* The ``telegram`` reporter mangled code blocks (e.g. the traceback of a differ error), could send a code block split
+  across messages in a message longer than Telegram's maximum, and merged a line too long for one message with the
+  following one. See :ref:`here <telegram>`.
+
+Internals impacting hooks.py
+````````````````````````````
+* ``FilterBase.raise_import_error()``, ``DifferBase.raise_import_error()`` and ``ReporterBase.raise_import_error()``
+  now also accept the ``ImportError`` itself and an optional ``extra`` argument (the extra that installs the package),
+  and raise the standard error described above; the new ``webchanges.util.missing_dependency()`` returns it for other
+  code.
+* Removed the unused ``webchanges.util.lazy_import()`` and ``webchanges.util.import_optional_dependency()``: import
+  the package inside the function that needs it, with ``missing_dependency()`` for its ``ImportError``.
+
+Internals
+`````````
+* Faster start-up: optional packages are imported only by the code that uses them (importing a run's modules went
+  from about 1.5 s to 0.45 s on Python 3.14), and on Python 3.15 the modules declare ``__lazy_modules__`` (`PEP 810
+  <https://peps.python.org/pep-0810/>`__) to defer their other imports until first needed.
+* CI: restored the CodeQL analysis step, mistakenly removed in version 3.34.2, and made the Redis storage tests
+  actually run; the workflow token is now read-only except in the deploy job, and test jobs time out after 30 minutes.
+* Testing: Python 3.15 and 3.15t replace 3.11 and 3.14t in the CI test matrix (and 3.15 replaces 3.11 in ``tox``), a
+  failing CI test job no longer cancels the others, and ``jq`` is also tested on Windows and free-threaded Python.
+* Testing: a new test checks that the code, the bundled JSON Schemas and the documentation agree on the filters, job
+  directives and configuration directives.
+* Testing: new tests of the classification of each run (new, changed, error, etc.) over consecutive runs, of the
+  ``httpx``, ``requests`` and ``curl_cffi`` HTTP clients giving the same results, and of the ``telegram`` reporter's
+  escaping and splitting into messages.
+* CI: before publishing, the deploy job checks that the release tag matches ``__version__`` and the top section of
+  ``CHANGELOG.rst``, which must be dated.
+* CI: the test suite no longer runs twice for a release push (branch and tag) or for a pull request's branch (push and
+  pull request).
+* CI: removed the unconfigured ClusterFuzzLite workflow, which failed on every pull request.
+* tox: the ``pre-commit`` environment runs ``pre-commit autoupdate`` before the hooks.
+* Updated the vendored copy of ``packaging`` from v26.2 to v26.3.
+* Code modernized for Python 3.12 and newer (PEP 695 syntax), and the optional-import fallbacks hidden from the type
+  checker for a clean ``ty`` run.
+
+
 Version 3.37.0
 -------------------
 2026-08-02
@@ -50,14 +280,6 @@ Added
   each unique endpoint requires manual browser authorization only once per run, and the connection is cached for the
   lifetime of the run (set the environment variable ``WEBCHANGES_BROWSER_CDP_CACHE=0`` to disable caching). See
   :ref:`here <connect_over_cdp>`.
-* New ``empty_as_transient`` job directive for ``url`` jobs (without ``use_browser: true``): when the server returns
-  an empty response, it is treated as a transient HTTP error (with the synthetic HTTP response status code 999)
-  instead of as valid empty content, so the snapshot database retains the last non-empty content and a flaky site
-  that intermittently returns nothing no longer triggers a change report when the content "disappears" and another
-  one when it is restored. Combine with ``max_tries`` to be notified only of persistent empty responses, or with
-  ``ignore_http_error_codes: 999`` to never be notified of them. Suggested by `Marcos Alano
-  <https://github.com/mhalano>`__ in `#169 <https://github.com/mborsetti/webchanges/issues/169>`__. See
-  :ref:`here <empty_as_transient>`.
 * New ``between`` filter: extracts the block of lines sitting between a line matching the ``start`` regular
   expression and one matching the ``end`` regular expression (the two delimiting lines themselves are discarded;
   omitting ``start`` extracts from the first line, omitting ``end`` to the last). Useful for clipping a section out
@@ -831,7 +1053,7 @@ Added
   jobs with 'blue' in their name (case-sensitive, so not 'Blue'), while ``webchanges --list (?i)blue`` is
   `case-insensitive <https://docs.python.org/3/library/re.html#re.I>`__.
 * New URL job directive ``params`` for specifying URL parameters (query strings), e.g. as a dictionary.
-* New ``gotify`` reporter (upstream contribution: `link <https://github.com/thp/urlwatch/pull/823/files>`__).
+* New ``gotify`` reporter.
 * Improved messaging at startup when a legacy database that requires conversion is found.
 
 Changed

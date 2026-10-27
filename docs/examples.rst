@@ -194,7 +194,7 @@ installed.
 .. code-block:: yaml
 
    job_defaults:
-     url:
+     url_jobs:
        headers:
          Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
          Accept-Language: en-US,en;q=0.9
@@ -290,6 +290,15 @@ or ignore all HTTP errors if you like by using :ref:`ignore_http_error_codes`:
    # yaml-language-server: $schema=jobs.schema.json
    url: https://example.com/
    ignore_http_error_codes: 4xx, 5xx
+
+A server that sometimes closes the connection before sending the complete response can be silenced with
+:ref:`ignore_incomplete_reads`:
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=jobs.schema.json
+   url: https://example.com/
+   ignore_incomplete_reads: true
 
 
 .. _bypassing_bot_walls:

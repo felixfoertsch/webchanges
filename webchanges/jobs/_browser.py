@@ -4,6 +4,19 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = [
+    'contextlib',
+    'html',
+    'json',
+    'pathlib',
+    'platform',
+    're',
+    'tempfile',
+    'time',
+    'urllib.parse',
+    'warnings',
+]
+
 import html
 import json
 import logging
@@ -17,11 +30,12 @@ import warnings
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
-from urllib.parse import SplitResult, SplitResultBytes, parse_qsl, quote, urlencode, urlparse, urlsplit
+from urllib.parse import SplitResult, parse_qsl, quote, unquote, urlencode, urlparse, urlsplit
 
 from webchanges import __project_name__
 from webchanges.jobs._base import UrlJobBase
 from webchanges.jobs._exceptions import (
+    EMPTY_RESPONSE_STATUS_CODE,
     BrowserResponseError,
     NotModifiedError,
     TransientBrowserError,
@@ -31,16 +45,19 @@ from webchanges.jobs._exceptions import (
 # https://stackoverflow.com/questions/39740632
 if TYPE_CHECKING:
     try:
-        from playwright.sync_api import Browser, Page, Playwright, Response
+        from playwright.sync_api import Browser, Page, Playwright, ProxySettings, Response
     except ImportError:  # pragma: no cover
         pass
 
     from webchanges.handler import JobState
 
+# The fallback assignment below is hidden from the type checker behind `if not TYPE_CHECKING` (see webchanges/jobs/
+# _url.py for the full explanation).
 try:
     import httpx
 except ImportError:  # pragma: no cover
-    httpx = None  # ty:ignore[invalid-assignment]
+    if not TYPE_CHECKING:
+        httpx = None
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +158,27 @@ def _acquire_cdp_browser(
     return cache.playwright, browser, False
 
 
+def _proxy_settings(proxy: str) -> ProxySettings:
+    """Convert a proxy URL into Playwright's ProxySettings.
+
+    The port and the (percent-decoded) credentials are included only if present in the URL, e.g.
+    ``https://user:p%40ss@proxy.example.com:8080`` becomes ``{'server': 'https://proxy.example.com:8080', 'username':
+    'user', 'password': 'p@ss'}``. A proxy without a scheme (``proxy.example.com:8080``) is taken to be HTTP.
+
+    :param proxy: The proxy URL.
+    :returns: The ProxySettings for Playwright's ``launch()``.
+    """
+    if '://' not in proxy:
+        proxy = f'http://{proxy}'
+    proxy_split = urlsplit(proxy)
+    settings: ProxySettings = {'server': f'{proxy_split.scheme}://{proxy_split.netloc.rpartition("@")[2]}'}
+    if proxy_split.username is not None:
+        settings['username'] = unquote(proxy_split.username)
+    if proxy_split.password is not None:
+        settings['password'] = unquote(proxy_split.password)
+    return settings
+
+
 class BrowserJob(UrlJobBase):
     """Retrieve a URL using a real web browser (use_browser: true)."""
 
@@ -172,9 +210,6 @@ class BrowserJob(UrlJobBase):
     )
 
     use_browser = True
-
-    proxy_username: str = ''
-    proxy_password: str = ''
 
     # See https://source.chromium.org/chromium/chromium/src/+/master:net/base/net_error_list.h
     chromium_connection_errors = (  # range 100-199 Connection related errors
@@ -353,7 +388,8 @@ class BrowserJob(UrlJobBase):
         :raises TypeError: If the value provided in one of the directives is not of the correct type.
         :raises ImportError: If the ``playwright`` or ``psutil`` package is not installed.
         :raises NotModifiedError: If the server returns an HTTP 304 (Not Modified) response.
-        :raises TransientHTTPError: If an HTTP response code of 429, 500, 502, 503, or 504 is received.
+        :raises TransientHTTPError: If an HTTP response code of 429, 500, 502, 503, or 504 is received, or (with the
+           synthetic status code 999) if ``empty_as_error`` is set and the server returned an empty document.
         :raises TransientBrowserError: If a browser timeout or a transient connection error occurs.
         :raises BrowserResponseError: If no response is received or an HTTP response code between 400 and 599 is
            received.
@@ -368,7 +404,7 @@ class BrowserJob(UrlJobBase):
         try:
             from playwright._repo_version import version as playwright_version
             from playwright.sync_api import Error as PlaywrightError
-            from playwright.sync_api import HttpCredentials, ProxySettings, Route, sync_playwright
+            from playwright.sync_api import HttpCredentials, Route, sync_playwright
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         except ImportError:  # pragma: no cover
             raise ImportError(
@@ -452,20 +488,11 @@ class BrowserJob(UrlJobBase):
 
         proxy_str = self.get_proxy()
         if proxy_str is not None:
-            proxy_split: SplitResult | SplitResultBytes = urlsplit(proxy_str)
-            proxy: ProxySettings | None = {
-                'server': (
-                    f'{proxy_split.scheme!s}://{proxy_split.hostname!s}:{proxy_split.port!s}'
-                    if proxy_split.port
-                    else ''
-                ),
-                'username': str(proxy_split.username),
-                'password': str(proxy_split.password),
-            }
+            proxy: ProxySettings | None = _proxy_settings(proxy_str)
             proxy_for_logging = proxy.copy()
-            if proxy_for_logging['password']:
+            if proxy_for_logging.get('password'):
                 proxy_for_logging['password'] = '*******'  # noqa: S105 possible hardcoded password
-            logger.debug(f'Job {self.index_number}: Proxy: {proxy_for_logging}')
+            logger.debug('Job %s: Proxy: %s', self.index_number, proxy_for_logging)
         else:
             proxy = None
 
@@ -770,6 +797,20 @@ class BrowserJob(UrlJobBase):
                     raise NotModifiedError(response.status)
 
                 if response.ok:
+                    # If empty_as_error is set and the server sent an empty (or whitespace-only) document, raise the
+                    # error before spending time on waits. The check must use the raw network body: the rendered DOM
+                    # (page.content()) is never empty because the browser always synthesizes a document skeleton.
+                    if self.empty_as_error:
+                        try:
+                            body_len: int | None = len(response.body().strip())
+                        except PlaywrightError:
+                            body_len = None  # raw body unavailable; cannot determine emptiness
+                        if body_len == 0:
+                            logger.info(f'Job {self.index_number}: No data received; treating it as an error.')
+                            raise TransientHTTPError(
+                                'No data received and empty_as_error is set',
+                                status_code=EMPTY_RESPONSE_STATUS_CODE,
+                            )
                     if self.wait_for_url:
                         logger.info(f'Job {self.index_number}: Waiting for page to navigate to {self.wait_for_url}')
                         if isinstance(self.wait_for_url, str):
@@ -923,10 +964,14 @@ class BrowserJob(UrlJobBase):
         """
         from playwright.sync_api import Error as PlaywrightError
 
-        if self.ignore_connection_errors and (
-            isinstance(exception, (PlaywrightError, TransientHTTPError, TransientBrowserError))
-        ):
-            return True
+        if self.ignore_connection_errors:
+            # A TransientHTTPError carrying the synthetic status code of the empty_as_error directive is excluded:
+            # the server did respond, so an empty response is not a connection problem.
+            if isinstance(exception, TransientHTTPError):
+                if exception.status_code != EMPTY_RESPONSE_STATUS_CODE:
+                    return True
+            elif isinstance(exception, (PlaywrightError, TransientBrowserError)):
+                return True
         if (
             self.ignore_timeout_errors
             and isinstance(exception, TransientBrowserError)
@@ -939,11 +984,10 @@ class BrowserJob(UrlJobBase):
             and exception.args[0] == 'net::ERR_TOO_MANY_REDIRECTS'
         ):
             return True
-        if (
-            self.ignore_http_error_codes
-            and isinstance(exception, BrowserResponseError)
-            and exception.status_code is not None
-        ):
-            return self._ignore_http_error_code(exception.status_code)
+        if self.ignore_http_error_codes:
+            if isinstance(exception, BrowserResponseError) and exception.status_code is not None:
+                return self._ignore_http_error_code(exception.status_code)
+            if isinstance(exception, TransientHTTPError):
+                return self._ignore_http_error_code(exception.status_code)
 
         return False

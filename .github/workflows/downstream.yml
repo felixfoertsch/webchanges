@@ -1,0 +1,54 @@
+name: Fork packages
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+jobs:
+  build:
+    if: github.repository == 'felixfoertsch/webchanges'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.14.8'}
+      - run: |
+          set -euo pipefail
+          python -m pip install -r scripts/build-requirements.txt
+          export PIP_CONSTRAINT="$GITHUB_WORKSPACE/scripts/build-requirements.txt"
+          export PIP_BUILD_CONSTRAINT="$PIP_CONSTRAINT"
+          python scripts/publish_release.py prepare
+          python -m pip install . -r tests/requirements_pytest.txt
+          python -m pytest tests/test_differs.py tests/test_reporters.py tests/test_newsletter_failures.py tests/test_publish_release.py -q -k 'not test_mailer_send'
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          python -m build --no-isolation
+          python scripts/normalize_sdist.py dist/*.tar.gz "$SOURCE_DATE_EPOCH"
+          mkdir candidate
+          mv dist candidate/dist
+          python scripts/publish_release.py manifest
+      - uses: actions/upload-artifact@v4
+        with: {name: packages, path: candidate, if-no-files-found: error}
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - uses: actions/download-artifact@v4
+        with: {name: packages, path: candidate}
+      - name: Verify exact revision and immutable assets, publish without running application code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 scripts/publish_release.py publish

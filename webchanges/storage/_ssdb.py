@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = ['datetime', 'pathlib']
+
 import logging
 import os
 from abc import abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from webchanges.handler import ErrorData, Snapshot
 from webchanges.storage._base import BaseFileStorage
@@ -19,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 class SsdbStorage(BaseFileStorage):
     """Base class for snapshots storage."""
+
+    # Bulk cleanup optionally provided by backends (e.g. SQLite3). Annotation only — creates no runtime attribute, so
+    # the hasattr() capability check in clean_ssdb() still works.
+    clean_all: Callable[..., int]
 
     @abstractmethod
     def close(self) -> None:
@@ -86,12 +92,13 @@ class SsdbStorage(BaseFileStorage):
         """
 
     @abstractmethod
-    def rollback(self, timestamp: float) -> int | None:
+    def rollback(self, timestamp: float, count: bool = False) -> int | None:
         """Rolls back the database to timestamp.
 
         :param timestamp: The timestamp.
+        :param count: If True, only count the number of records that would be deleted without deleting them.
 
-        :returns: Number of records deleted.
+        :returns: Number of records deleted (or that would be deleted).
         :raises: NotImplementedError for those classes where this method is not implemented.
         """
 
@@ -137,7 +144,7 @@ class SsdbStorage(BaseFileStorage):
         :param keep_entries: Number of entries to keep after deletion.
         """
         if hasattr(self, 'clean_all'):
-            count = self.clean_all(keep_entries)  # ty:ignore[call-non-callable]
+            count = self.clean_all(keep_entries)
             if count:
                 print(f'Deleted {count} old snapshots.')
         else:
@@ -255,7 +262,7 @@ class SsdbDirStorage(SsdbStorage):
             raise ValueError(f'Old snapshot file {old_filepath} does not exist')
         return 1
 
-    def rollback(self, timestamp: float) -> None:
+    def rollback(self, timestamp: float, count: bool = False) -> None:
         raise NotImplementedError("'textfiles' databases cannot be rolled back as new snapshots overwrite old ones")
 
     def flushdb(self) -> None:

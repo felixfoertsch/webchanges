@@ -8,11 +8,12 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = ['pathlib', 'platform', 'platformdirs', 'shutil', 'subprocess', 'warnings']
+
 import logging
 import os
 import platform
 import shutil
-import signal
 import subprocess
 import sys
 import warnings
@@ -24,14 +25,10 @@ from webchanges import __copyright__, __docs_url__, __min_python_version__, __pr
 from webchanges.config import CommandConfig
 from webchanges.util import edit_file, file_ownership_checks, get_new_version_number, import_module_from_source
 
-# Restore the default system behavior for the SIGPIPE signal, which is ignored by Python by default.
-# This prevents a BrokenPipeError when piping output to a command like `less` that may close the pipe before reading all
-# of the output.
-try:
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # not defined in Windows  # ty:ignore[unresolved-attribute]
-except AttributeError:
-    pass
-
+# SIGPIPE is deliberately left at Python's default (ignored, so that writing to a closed pipe or socket raises
+# BrokenPipeError). Restoring the system default (SIG_DFL) would make the OS kill the process outright, with no error
+# reported, whenever a server (SMTP, HTTP, ...) closes a connection that is being written to. A reader of stdout that
+# exits early (e.g. `webchanges --list | head`) is handled in main() instead.
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +72,12 @@ def migrate_from_legacy(
         ('hooks.py', hooks_file),
     ]
     if any(dest is not None for _, dest in yaml_dests):
+        # Like urlwatch itself: ~/.urlwatch if it exists, otherwise the platform's configuration directory (e.g.
+        # ~/.config/urlwatch on Linux).
         legacy_project_path = Path.home() / f'.{legacy_package}'
+        if not legacy_project_path.is_dir():
+            legacy_project_path = platformdirs.user_config_path(legacy_package)
+        logger.debug('Looking for legacy %s files in %s', legacy_package, legacy_project_path)
         if legacy_project_path.is_dir():
             pairs.extend((legacy_project_path / name, dest) for name, dest in yaml_dests if dest is not None)
 
@@ -150,6 +152,22 @@ def teardown_logger(verbose: int | None = None) -> None:
         os.environ.pop('DEBUG', None)
 
 
+def _glob_files(pattern: Path, ext: str | None = None) -> list[Path]:
+    """The files matching a glob pattern, sorted; a pattern that is a directory matches the files with extension 'ext'
+    (all files if None) in its whole tree.
+
+    :param pattern: The glob pattern, file or directory.
+    :param ext: The extension, e.g. '.yaml', of the files to match within a directory.
+
+    :returns: The sorted list of the matching files (no directories).
+    """
+    if pattern.is_dir():
+        logger.debug('Searching directory %s recursively for *%s files', pattern, ext or '')
+        return sorted(f for f in pattern.rglob(f'*{ext or ""}') if f.is_file())
+    # https://stackoverflow.com/questions/56311703/globbing-absolute-paths-with-pathlib
+    return sorted(f for f in Path(pattern.anchor).glob(str(pattern.relative_to(pattern.anchor))) if f.is_file())
+
+
 def _expand_glob_files(
     filename: Path,
     default_path: Path,
@@ -157,38 +175,40 @@ def _expand_glob_files(
     prefix: str | None = None,
 ) -> list[Path]:
     """Searches for file both as specified and in the default directory, then retries with 'ext' extension if defined.
+    A directory stands for all the files with extension 'ext' in its tree.
 
-    :param filename: The filename.
+    :param filename: The filename, glob pattern or directory.
     :param default_path: The default directory.
     :param ext: The extension, e.g. '.yaml', to add for searching if first scan fails.
     :param prefix: The prefix, e.g. 'config', to add with a hypen (e.g. 'config-') for searching if first scan fails.
 
-    :returns: The filename, either original or one with path where found and/or extension.
+    :returns: The sorted matching files, or the filename if none is found.
     """
     search_filenames = [filename]
 
-    # if ext is given, iterate both on raw filename and the filename with ext if different
-    if ext and filename.suffix != ext:
-        search_filenames.append(filename.with_suffix(ext))
-
-    # if prefix is given, iterate both on raw filename and the filename with prefix if different
-    if prefix and not filename.name.startswith(prefix):
-        search_filenames.append(filename.with_stem(f'{prefix}-{filename.stem}'))
+    if filename.name:  # e.g. '.' has no name, so no variations
+        # if ext is given, iterate both on raw filename and the filename with ext if different
         if ext and filename.suffix != ext:
-            search_filenames.append(filename.with_stem(f'{prefix}-{filename.stem}').with_suffix(ext))
+            search_filenames.append(filename.with_suffix(ext))
+
+        # if prefix is given, iterate both on raw filename and the filename with prefix if different
+        if prefix and not filename.name.startswith(prefix):
+            search_filenames.append(filename.with_stem(f'{prefix}-{filename.stem}'))
+            if ext and filename.suffix != ext:
+                search_filenames.append(filename.with_stem(f'{prefix}-{filename.stem}').with_suffix(ext))
 
     # try as given
     for file in search_filenames:
-        # https://stackoverflow.com/questions/56311703/globbing-absolute-paths-with-pathlib
-        file_list = list(Path(file.anchor).glob(str(file.relative_to(file.anchor))))
-        if any(f.is_file() for f in file_list):
+        if file_list := _glob_files(file, ext):
             return file_list
 
         # no directory specified (and not in current one): add default one
-        if not file.is_absolute() and Path(file).parent != Path.cwd():
-            file_list = list(default_path.glob(str(file)))
-            if any(f.is_file() for f in file_list):
-                return file_list
+        if (
+            not file.is_absolute()
+            and Path(file).parent != Path.cwd()
+            and (file_list := _glob_files(default_path.joinpath(file), ext))
+        ):
+            return file_list
 
     # no matches found
     return [filename]
@@ -200,11 +220,80 @@ def locate_glob_files(
     ext: str | None = None,
     prefix: str | None = None,
 ) -> list[Path]:
-    job_files = set()
-    for filename in filenames:
-        for file in _expand_glob_files(filename, default_path, ext, prefix):
-            job_files.add(file)
-    return list(job_files)
+    """Expands each filename, glob pattern or directory into the files it matches, keeping the order given (and
+    dropping duplicates) so that jobs are always concatenated, and therefore numbered, the same way.
+
+    :param filenames: The filenames, glob patterns or directories.
+    :param default_path: The default directory.
+    :param ext: The extension, e.g. '.yaml', to add for searching if first scan fails.
+    :param prefix: The prefix, e.g. 'config', to add with a hypen (e.g. 'config-') for searching if first scan fails.
+
+    :returns: The files found.
+    """
+    return list(
+        dict.fromkeys(
+            file for filename in filenames for file in _expand_glob_files(filename, default_path, ext, prefix)
+        )
+    )
+
+
+def _read_file_directives(config_file: Path) -> dict[str, list[Path]]:
+    """Read the 'jobs' and 'hooks' directives of the configuration file, which are needed before the file is loaded
+    (as the hooks must be imported first). Relative paths are taken from the configuration file's directory.
+
+    :param config_file: The configuration file.
+
+    :returns: The filenames, glob patterns or directories, by name of the directive (only those set).
+    """
+    import yaml
+
+    from webchanges.storage import YamlConfigStorage
+
+    try:
+        config = YamlConfigStorage.parse(config_file)
+    except (OSError, yaml.YAMLError) as exc:  # reported when the configuration file is loaded
+        logger.debug('Could not read the jobs and hooks directives of %s: %s', config_file, exc)
+        return {}
+    if not isinstance(config, dict):
+        return {}
+    directives = {}
+    for name in ('jobs', 'hooks'):
+        value = config.get(name)
+        if isinstance(value, str):
+            value = [value]
+        # an invalid value is reported when the configuration file is loaded
+        if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+            directives[name] = [config_file.parent.joinpath(Path(v).expanduser()) for v in value]
+            logger.info('Configuration file directive %s is %s', name, value)
+    return directives
+
+
+def locate_jobs_and_hooks_files(command_config: CommandConfig) -> None:
+    """Locate the jobs and hooks files: those given with the command line arguments --jobs and --hooks, else those in
+    the configuration file's 'jobs' and 'hooks' directives, else the default ones. The configuration file must already
+    have been located.
+
+    :param command_config: The CommandConfig, whose jobs_files and hooks_files are replaced with the files found.
+    """
+    if not (command_config.jobs_files_inputted and command_config.hooks_files_inputted):
+        directives = _read_file_directives(command_config.config_file)
+        if not command_config.jobs_files_inputted and 'jobs' in directives:
+            command_config.jobs_files = directives['jobs']
+        if not command_config.hooks_files_inputted and 'hooks' in directives:
+            command_config.hooks_files = directives['hooks']
+            command_config.hooks_files_inputted = True  # warn if missing, as for --hooks
+    command_config.jobs_files = locate_glob_files(
+        filenames=command_config.jobs_files,
+        default_path=command_config.config_path,
+        ext='.yaml',
+        prefix='jobs',
+    )
+    command_config.hooks_files = locate_glob_files(
+        filenames=command_config.hooks_files,
+        default_path=command_config.config_path,
+        ext='.py',
+        prefix='hooks',
+    )
 
 
 def locate_storage_file(
@@ -249,27 +338,6 @@ def locate_storage_file(
     return filename
 
 
-def locate_storage_files(
-    filename_list: list[Path],
-    default_path: Path,
-    ext: str | None = None,
-    prefix: str | None = None,
-) -> set[Path]:
-    """Searches for file both as specified and in the default directory, then retries with 'ext' extension if defined.
-
-    :param filename_list: The list of filenames.
-    :param default_path: The default directory.
-    :param ext: The extension, e.g. '.yaml', to add for searching if first scan fails.
-    :param prefix: The prefix, e.g. 'config', to add with a hypen (e.g. 'config-') for searching if first scan fails.
-
-    :returns: The list filenames, either originals or ones with path where found and/or extension.
-    """
-    filenames = set()
-    for filename in filename_list:
-        filenames.add(locate_storage_file(filename, default_path, ext, prefix))
-    return filenames
-
-
 def first_run(command_config: CommandConfig) -> None:
     """Create configuration and jobs files.
 
@@ -284,6 +352,8 @@ def first_run(command_config: CommandConfig) -> None:
         if not command_config.edit_config:
             print(f'> Edit it with {__project_name__} --edit-config')
     if not any(f.is_file() for f in command_config.jobs_files):
+        if command_config.jobs_files[0].is_dir():  # a directory without jobs files
+            command_config.jobs_files[0] = command_config.jobs_files[0].joinpath('jobs.yaml')
         command_config.jobs_files[0].parent.mkdir(parents=True, exist_ok=True)
         command_config.jobs_files[0].write_text(
             f'# {__project_name__} jobs file. See {__docs_url__}en/stable/jobs.html\n'
@@ -450,18 +520,7 @@ def handle_unitialized_actions(urlwatch_config: CommandConfig, default_config_fi
             ext='.yaml',
             prefix='config',
         )
-        urlwatch_config.jobs_files = locate_glob_files(
-            filenames=urlwatch_config.jobs_files,
-            default_path=urlwatch_config.config_path,
-            ext='.yaml',
-            prefix='jobs',
-        )
-        urlwatch_config.hooks_files = locate_glob_files(
-            filenames=urlwatch_config.hooks_files,
-            default_path=urlwatch_config.config_path,
-            ext='.py',
-            prefix='hooks',
-        )
+        locate_jobs_and_hooks_files(urlwatch_config)
         sync_bundled_schemas(urlwatch_config)
         if (
             default_config_file is not None
@@ -629,7 +688,7 @@ def show_detailed_versions() -> int:
 
     def dependencies() -> list[str]:
         try:
-            from pip._internal.metadata import get_default_environment  # ty:ignore[unresolved-import]
+            from pip._internal.metadata import get_default_environment
 
             env = get_default_environment()
             dist = None
@@ -650,7 +709,6 @@ def show_detailed_versions() -> int:
             'aioxmpp',
             'beautifulsoup4',
             'chump',
-            'colorama',
             'cryptography',
             'cssbeautifier',
             'cssselect',
@@ -698,10 +756,12 @@ def show_detailed_versions() -> int:
     )
     print(f'• SQLite: {sqlite3.sqlite_version}')
 
+    psutil_available = False
     try:
         import psutil
         from psutil._common import bytes2human
 
+        psutil_available = True
         print()
         print('System:')
         print(f'• Platform: {platform.platform()}, {platform.machine()}')
@@ -740,7 +800,7 @@ def show_detailed_versions() -> int:
         from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import sync_playwright
 
-        if psutil:
+        if psutil_available:
             try:
                 virt_mem_before = psutil.virtual_memory().available
                 swap_mem_before = psutil.swap_memory().free
@@ -754,7 +814,7 @@ def show_detailed_versions() -> int:
                 browser = p.chromium.launch(channel='chrome')
                 print(f'• Name: {browser.browser_type.name}')
                 print(f'• Version: {browser.version}')
-                if psutil:
+                if psutil_available:
                     try:
                         print(
                             f'• Free memory before launching browser: '
@@ -763,7 +823,7 @@ def show_detailed_versions() -> int:
                         )
                     except NameError:
                         pass
-                if psutil:
+                if psutil_available:
                     browser.new_page()
                     try:
                         virt_mem_loaded = psutil.virtual_memory().available
@@ -846,10 +906,39 @@ def show_detailed_versions() -> int:
     return 0
 
 
-def main() -> None:  # pragma: no cover
-    """The entry point run when __name__ == '__main__'.
+def _stdout_is_broken() -> bool:
+    """Whether stdout's reader has gone away (e.g. `less` or `head` exited before reading all of the output).
 
-    Contains all the high-level logic to instantiate all classes that run the program.
+    A failed write leaves its data in stdout's buffer, so flushing it again raises BrokenPipeError only if stdout itself
+    is the broken pipe (and not, e.g., a socket to a server that closed the connection).
+    """
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        return True
+    return False
+
+
+def main() -> None:
+    """The entry point (console script and `python -m webchanges`): runs the program, stopping quietly if the reader of
+    stdout goes away before reading all of the output, as recommended in the documentation of the `signal` module.
+
+    :raises BrokenPipeError: If raised by anything other than writing to stdout (e.g. a server closing a connection).
+    """
+    try:
+        _main()
+        sys.stdout.flush()  # surface a broken stdout pipe while still inside this try block
+    except BrokenPipeError:
+        if not _stdout_is_broken():
+            raise
+        # Point stdout to devnull so that Python's flush of stdout at exit does not raise BrokenPipeError again
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(1)  # the exit code Python itself uses for a broken pipe
+
+
+def _main() -> None:  # pragma: no cover
+    """Run the program. Contains all the high-level logic to instantiate all classes that run the program.
 
     :raises NotImplementedError: If a `--database-engine` is specified that is not supported.
     :raises RuntimeError: If `--database-engine redis` is selected but `--cache` with a redis URI is not provided.
@@ -928,18 +1017,7 @@ def main() -> None:  # pragma: no cover
         ext='.yaml',
         prefix='config',
     )
-    command_config.jobs_files = locate_glob_files(
-        filenames=command_config.jobs_files,
-        default_path=command_config.config_path,
-        ext='.yaml',
-        prefix='jobs',
-    )
-    command_config.hooks_files = locate_glob_files(
-        filenames=command_config.hooks_files,
-        default_path=command_config.config_path,
-        ext='.py',
-        prefix='hooks',
-    )
+    locate_jobs_and_hooks_files(command_config)
     command_config.ssdb_file = locate_storage_file(
         filename=command_config.ssdb_file,
         default_path=data_path,

@@ -4,8 +4,22 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = [
+    'html',
+    'html2text',
+    'importlib.util',
+    'json',
+    'lxml',
+    'lxml.cssselect',
+    're',
+    'urllib.parse',
+    'warnings',
+    'xml.dom',
+]
+
 import html
 import importlib.util
+import json
 import logging
 import re
 import warnings
@@ -21,24 +35,13 @@ from lxml import etree
 from lxml.cssselect import CSSSelector
 
 from webchanges.filters._base import AutoMatchFilter, FilterBase, RegexMatchFilter
+from webchanges.util import missing_dependency
 
 if TYPE_CHECKING:
     from webchanges.jobs import JobBase
 
-try:
-    import bs4
-except ImportError as e:  # pragma: has-bs4
-    bs4 = str(e)  # ty:ignore[invalid-assignment]
-
-try:
-    import cssbeautifier
-except ImportError as e:  # pragma: no cover
-    cssbeautifier = str(e)  # ty:ignore[invalid-assignment]
-
-try:
-    import jsbeautifier
-except ImportError as e:  # pragma: no cover
-    jsbeautifier = str(e)  # ty:ignore[invalid-assignment]
+# Optional dependencies (beautifulsoup4, jsbeautifier, cssbeautifier) are imported inside the filters that use them, so
+# that only the runs that need them pay for importing them (see missing_dependency() in webchanges/util.py).
 
 logger = logging.getLogger(__name__)
 
@@ -69,17 +72,25 @@ class BeautifyFilter(FilterBase):
         :param subfilter: The subfilter information.
         :returns: The data and media type (fka MIME type) of the data after the filter has been applied.
         """
-        if isinstance(bs4, str):
-            self.raise_import_error('BeautifulSoup', self.__kind__, bs4)
+        try:
+            import bs4
+        except ImportError as e:  # pragma: has-bs4
+            self.raise_import_error('beautifulsoup4', self.__kind__, e, extra='beautify')
 
         bs4_features = 'lxml' if importlib.util.find_spec('lxml') is not None else 'html'
         soup = bs4.BeautifulSoup(data, features=bs4_features)
 
-        if isinstance(jsbeautifier, str):
-            logger.warning(
-                f"Python package 'jsbeautifier' cannot be imported; will not beautify <script> tags"
-                f' ({self.job.get_indexed_location()})\n{jsbeautifier}'
+        try:
+            import jsbeautifier
+        except ImportError as e:  # pragma: no cover
+            error = missing_dependency(
+                e,
+                'jsbeautifier',
+                used_by='beautifying <script> tags',
+                extra='beautify',
+                location=self.job.get_indexed_location(),
             )
+            logger.warning(f'{error} The <script> tags are left as they are.')
         else:
             scripts = soup.find_all('script')
             for script in scripts:
@@ -87,11 +98,17 @@ class BeautifyFilter(FilterBase):
                     beautified_js = jsbeautifier.beautify(script.string)
                     script.string = beautified_js
 
-        if isinstance(cssbeautifier, str):
-            logger.warning(
-                "Python package 'cssbeautifier' cannot be imported; will not beautify <style> tags"
-                f' ({self.job.get_indexed_location()})\n{cssbeautifier}'
+        try:
+            import cssbeautifier
+        except ImportError as e:  # pragma: no cover
+            error = missing_dependency(
+                e,
+                'cssbeautifier',
+                used_by='beautifying <style> tags',
+                extra='beautify',
+                location=self.job.get_indexed_location(),
             )
+            logger.warning(f'{error} The <style> tags are left as they are.')
         else:
             styles = soup.find_all('style')
             for style in styles:
@@ -101,7 +118,7 @@ class BeautifyFilter(FilterBase):
 
         if subfilter.get('absolute_links') is None or subfilter.get('absolute_links'):
             for link in soup.find_all('a', href=True):
-                link['href'] = urljoin(self.job.url, link['href'])
+                link['href'] = urljoin(self.job.url, str(link['href']))
 
         indent = subfilter.get('indent', 1)
         return soup.prettify(formatter=bs4.formatter.HTMLFormatter(indent=indent)), mime_type
@@ -174,6 +191,10 @@ class Html2TextFilter(FilterBase):
 
         * ``strip_tags``: A simple and fast regex-based HTML tag stripper.
 
+        If the data's media type is JSON and the entire document is a JSON string (i.e. HTML that has been
+        JSON-encoded), it is decoded with ``json.loads()`` first so that e.g. ``\\u00e9`` becomes ``é``; JSON objects
+        and arrays are passed through unchanged.
+
         :param data: The data to be filtered (processed).
         :param subfilter: The subfilter information.
         :returns: The data and media type (fka MIME type) of the data after the filter has been applied.
@@ -181,8 +202,48 @@ class Html2TextFilter(FilterBase):
         # extract method and options from subfilter, defaulting to method html2text
         if not isinstance(data, str):
             raise ValueError
+
+        if mime_type.endswith('json'):
+            # The data is JSON-encoded; if it's a bare JSON string, decode it so that \uXXXX escapes become the
+            # characters they represent before the HTML is converted to text.
+            try:
+                decoded_json = json.loads(data)
+            except json.JSONDecodeError as e:
+                logger.debug(
+                    'Filter html2text: data has media type %s but is not valid JSON (%s); using it as is (%s)',
+                    mime_type,
+                    e,
+                    self.job.get_indexed_location(),
+                )
+            else:
+                if isinstance(decoded_json, str):
+                    logger.info(
+                        'Filter html2text: decoded the JSON-encoded string of media type %s before converting it (%s)',
+                        mime_type,
+                        self.job.get_indexed_location(),
+                    )
+                    data = decoded_json
+                else:
+                    logger.debug(
+                        'Filter html2text: data of media type %s decodes to a %s, not a string; using it as is (%s)',
+                        mime_type,
+                        type(decoded_json).__name__,
+                        self.job.get_indexed_location(),
+                    )
+
         options = subfilter.copy()
         method = options.pop('method', 'html2text')
+
+        if method == 'lynx':  # urlwatch; lynx's options (e.g. width) mean nothing to the html2text package
+            ignored = f' and its options {", ".join(options)}, which are ignored' if options else ''
+            warnings.warn(
+                f"Filter html2text's method 'lynx' is no longer supported and the filter's default method is used "
+                f'instead: remove method{ignored} ({self.job.get_indexed_location()})',
+                DeprecationWarning,
+                stacklevel=1,
+            )
+            method = 'html2text'
+            options = {}
 
         if method in {'html2text', 'pyhtml2text'}:  # pythtml2text for backward compatibility
             if method == 'pyhtml2text':
@@ -209,8 +270,10 @@ class Html2TextFilter(FilterBase):
             return '\n'.join(line.rstrip() for line in parser.handle(data).splitlines()), 'text/markdown'
 
         if method == 'bs4':
-            if isinstance(bs4, str):
-                self.raise_import_error('BeautifulSoup', self.__kind__, bs4)
+            try:
+                import bs4
+            except ImportError as e:  # pragma: has-bs4
+                self.raise_import_error('beautifulsoup4', self.__kind__, e, extra='bs4')
 
             default_bs4_parser = 'lxml' if importlib.util.find_spec('lxml') is not None else 'html'
             bs4_parser: str = options.pop('parser', default_bs4_parser)
@@ -237,12 +300,6 @@ class Html2TextFilter(FilterBase):
                 )
             stripped_tags = html.unescape(re.sub(r'<[^>]*>', '', data))
             return '\n'.join((line.rstrip() for line in stripped_tags.splitlines() if line.strip() != '')), 'text/plain'
-
-        if method == 'lynx':
-            raise NotImplementedError(
-                f"Filter html2text's method 'lynx' is no longer supported; for similar results, use the filter without "
-                f'specifying a method. ({self.job.get_indexed_location()})'
-            )
 
         raise ValueError(f"Unknown method {method} for filter 'html2text'. ({self.job.get_indexed_location()})")
 
@@ -436,6 +493,10 @@ class LxmlParser:
         'css': 'a CSS selector',
         'xpath': 'an XPath expression',
     }
+    ROOT_EXPRS: dict[str, str] = {
+        'css': ':root',
+        'xpath': '/*',
+    }
 
     expression: str
     method: str
@@ -457,12 +518,13 @@ class LxmlParser:
                 f"The '{filter_kind}' filter's method must be 'html' or 'xml', got '{self.method}'. "
                 f'({job.get_indexed_location()})'
             )
-        if expr_key not in subfilter:
+        if expr_key not in subfilter and 'exclude' not in subfilter:
             raise ValueError(
                 f"The '{filter_kind}' filter needs {self.EXPR_NAMES[filter_kind]} for filtering. "
                 f'({job.get_indexed_location()})'
             )
-        self.expression = subfilter[expr_key]
+        # A filter with only 'exclude' returns the whole document (its root element) minus the exclusions
+        self.expression = subfilter.get(expr_key, self.ROOT_EXPRS[filter_kind])
         self.exclude = subfilter.get('exclude')
         self.namespaces = subfilter.get('namespaces')
         self.skip = int(subfilter.get('skip', 0))

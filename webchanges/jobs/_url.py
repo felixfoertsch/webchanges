@@ -4,53 +4,68 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = [
+    'datetime',
+    'email.utils',
+    'ftplib',
+    'html',
+    'html2text',
+    'importlib.util',
+    'json',
+    'pathlib',
+    're',
+    'ssl',
+    'time',
+    'urllib.parse',
+]
+
 import html
+import importlib.util
 import json
 import logging
 import re
 import ssl
 import sys
 import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from ftplib import FTP
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit
 
 import html2text
 
 from webchanges.filters import FilterBase
 from webchanges.jobs._base import CHARSET_RE, UrlJobBase
-from webchanges.jobs._exceptions import NotModifiedError, TransientHTTPError
+from webchanges.jobs._exceptions import EMPTY_RESPONSE_STATUS_CODE, NotModifiedError, TransientHTTPError
+from webchanges.util import missing_dependency
 
 # https://stackoverflow.com/questions/39740632
 if TYPE_CHECKING:
+    from requests.adapters import HTTPAdapter
+
     from webchanges.handler import JobState
 
+# The fallback assignments below are hidden from the type checker behind `if not TYPE_CHECKING`. Otherwise the type
+# checker infers the union of both bindings (e.g. `<module 'httpx'> | None`), and every reference to a module
+# attribute — including in annotations such as `httpx.Response`, which cannot be guarded at runtime — is reported as
+# unresolved. Hiding the fallback keeps the module type, which is what these code paths are guarded to run under.
 try:
     import httpx
 except ImportError:  # pragma: no cover
-    httpx = None  # ty:ignore[invalid-assignment]
+    if not TYPE_CHECKING:
+        httpx = None
 
 if httpx is not None:
     try:
         import h2
     except ImportError:  # pragma: no cover
-        h2 = None  # ty:ignore[invalid-assignment]
+        h2 = None
 
-try:
-    import requests
-    import urllib3
-    import urllib3.exceptions
-except ImportError as e:  # pragma: no cover
-    requests = str(e)  # ty:ignore[invalid-assignment]
-    urllib3 = str(e)  # ty:ignore[invalid-assignment]
-
-try:
-    from curl_cffi import requests as curl_cffi_requests
-    from curl_cffi.requests import exceptions as curl_cffi_exceptions
-except ImportError as e:  # pragma: no cover
-    curl_cffi_requests = str(e)  # ty:ignore[invalid-assignment]
-    curl_cffi_exceptions = str(e)  # ty:ignore[invalid-assignment]
+# The optional HTTP clients requests and curl_cffi are imported only by the code paths that use them (see
+# missing_dependency() in webchanges/util.py); their exceptions are recognized via sys.modules, as they can only have
+# been raised if the client was imported.
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +78,62 @@ _HTTPX_HTTP_VERSIONS: dict[str, tuple[bool, bool]] = {
 }
 _CURL_CFFI_HTTP_VERSIONS: tuple[str, ...] = ('v1', 'v2', 'v2tls', 'v2_prior_knowledge', 'v3', 'v3only')
 
+# Waits between the attempts made by the 'retries' directive (seconds): exponential backoff (1, 2, 4, ...) up to
+# RETRY_BACKOFF_MAX, or the server's Retry-After (on a 429 or 503) up to RETRY_AFTER_MAX, so a job can't stall a run.
+RETRY_BACKOFF_MAX = 30.0
+RETRY_AFTER_MAX = 60.0
+
+
+def weak_dh_requests_adapter(verify: bool) -> HTTPAdapter:
+    """A transport adapter for the requests library whose SSL context lowers the OpenSSL security level to 1, so that a
+    server's weak (1024-bit) Diffie-Hellman key is accepted (the 'ignore_dh_key_too_small' directive). Works with both
+    urllib3 1.x and 2.x.
+
+    :param verify: Whether certificates are verified (i.e. the job has no 'ssl_no_verify').
+    :returns: The adapter, to be mounted on the session for 'https://'.
+    """
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.ssl_ import create_urllib3_context
+
+    context = create_urllib3_context(
+        ciphers='DEFAULT@SECLEVEL=1', cert_reqs=ssl.CERT_REQUIRED if verify else ssl.CERT_NONE
+    )
+    if not verify:
+        context.check_hostname = False
+
+    class WeakDHAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+            kwargs['ssl_context'] = context
+            super().init_poolmanager(*args, **kwargs)
+
+        def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:  # noqa: ANN401
+            proxy_kwargs['ssl_context'] = context
+            return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+    return WeakDHAdapter()
+
+
+def retry_after_seconds(value: str | None) -> float | None:
+    """Converts the value of an HTTP Retry-After header, either a number of seconds or an HTTP date, into seconds.
+
+    :param value: The value of the header, if any.
+    :returns: The number of seconds to wait (not negative), or None if there is no (valid) value.
+    """
+    if not value:
+        return None
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        logger.debug(f'Ignoring unparseable Retry-After header {value!r}')
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    return max((retry_at - datetime.now(UTC)).total_seconds(), 0.0)
+
 
 class UrlJob(UrlJobBase):
     """Retrieve a URL from a web server."""
@@ -70,11 +141,11 @@ class UrlJob(UrlJobBase):
     __kind__ = 'url'
 
     __optional__: tuple[str, ...] = (
-        'empty_as_transient',
         'fingerprints',
         'http_client',
         'http_version',
         'ignore_dh_key_too_small',
+        'ignore_incomplete_reads',
         'impersonate',
         'initialization_url',
         'no_redirects',
@@ -168,17 +239,17 @@ class UrlJob(UrlJobBase):
 
         if self.ignore_dh_key_too_small:
             logger.debug(
-                'Setting default cipher list to ciphers that do not make any use of Diffie Hellman Key Exchange '
-                "and thus are not affected by the server's weak DH key"
+                'Lowering the OpenSSL security level to 1 so that a weak (1024-bit) Diffie-Hellman key is accepted'
             )
-            context: ssl.SSLContext | str | bool = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            # httpx's own context (its CA certificates, ssl_no_verify honored), as a bare SSLContext verifies nothing
+            context: ssl.SSLContext | str | bool = httpx.create_ssl_context(verify=not self.ssl_no_verify)
             context.set_ciphers('DEFAULT@SECLEVEL=1')
         else:
             context = not self.ssl_no_verify
 
         with httpx.Client(
             headers=headers,
-            cookies=self.cookies,
+            cookies=self.get_cookies(),
             verify=context,
             http1=http1,
             http2=http2,
@@ -237,7 +308,11 @@ class UrlJob(UrlJobBase):
 
             if response.status_code in (429, 500, 502, 503, 504):
                 logger.debug(f'Job {self.index_number}: Intercepted response with {response.status_code} status')
-                raise TransientHTTPError(http_error_msg, status_code=response.status_code)
+                raise TransientHTTPError(
+                    http_error_msg,
+                    status_code=response.status_code,
+                    retry_after=retry_after_seconds(response.headers.get('Retry-After')),
+                )
 
             raise httpx.HTTPStatusError(http_error_msg, request=response.request, response=response)
 
@@ -286,6 +361,10 @@ class UrlJob(UrlJobBase):
         :return: The data retrieved and the ETag.
         :raises NotModifiedError: If an HTTP 304 response is received.
         """
+        import requests  # availability already checked by retrieve()
+        import urllib3
+        import urllib3.exceptions
+
         logger.info(f'Job {self.index_number}: Using the requests HTTP client library')
         proxy_str = self.get_proxy()
         if proxy_str is not None:
@@ -305,26 +384,16 @@ class UrlJob(UrlJobBase):
                 f'ignoring the directive.'
             )
 
-        if self.ignore_dh_key_too_small:
-            # https://stackoverflow.com/questions/38015537
-            logger.debug(
-                'Setting default cipher list to ciphers that do not make any use of Diffie Hellman Key Exchange '
-                "and thus are not affected by the server's weak DH key"
-            )
-            try:
-                # only works with urllib3 <2.0
-                urllib3.util.ssl_.DEFAULT_CIPHERS += 'HIGH:!DH:!aNULL'
-            except AttributeError:
-                logger.error(
-                    'Unable to ignore_dh_key_too_small due to bug in requests.packages.urrlib3.util.ssl.DEFAULT_CIPHERS'
-                )
-                logger.error('See https://github.com/psf/requests/issues/6443')
-
         with requests.Session() as session:
+            if self.ignore_dh_key_too_small:
+                logger.debug(
+                    'Lowering the OpenSSL security level to 1 so that a weak (1024-bit) Diffie-Hellman key is accepted'
+                )
+                session.mount('https://', weak_dh_requests_adapter(verify=not self.ssl_no_verify))
             if headers:
                 session.headers.update(headers)
-            if self.cookies:
-                session.cookies.update(self.cookies)
+            if cookies := self.get_cookies():
+                session.cookies.update(cookies)
             if proxies:
                 session.proxies.update(proxies)
             session.verify = not self.ssl_no_verify
@@ -384,7 +453,11 @@ class UrlJob(UrlJobBase):
 
             if response.status_code in (429, 500, 502, 503, 504):
                 logger.debug(f'Job {self.index_number}: Response error is transient.')
-                raise TransientHTTPError(http_error_msg, status_code=response.status_code)
+                raise TransientHTTPError(
+                    http_error_msg,
+                    status_code=response.status_code,
+                    retry_after=retry_after_seconds(response.headers.get('Retry-After')),
+                )
 
             raise requests.HTTPError(http_error_msg, response=response)
 
@@ -442,6 +515,9 @@ class UrlJob(UrlJobBase):
         :return: The data retrieved, the ETag and media type.
         :raises NotModifiedError: If an HTTP 304 response is received.
         """
+        from curl_cffi import requests as curl_cffi_requests  # availability already checked by retrieve()
+        from curl_cffi.requests import exceptions as curl_cffi_exceptions
+
         impersonate = self.impersonate or 'chrome'
         logger.info(
             f'Job {self.index_number}: Using the curl_cffi HTTP client library '
@@ -463,7 +539,7 @@ class UrlJob(UrlJobBase):
 
         session_kwargs: dict[str, Any] = {
             'headers': headers,
-            'cookies': self.cookies,
+            'cookies': self.get_cookies(),
             'proxies': proxies,
             'verify': (not self.ssl_no_verify),
             'timeout': timeout,
@@ -543,7 +619,11 @@ class UrlJob(UrlJobBase):
 
             if response.status_code in (429, 500, 502, 503, 504):
                 logger.debug(f'Job {self.index_number}: Response error is transient.')
-                raise TransientHTTPError(http_error_msg, status_code=response.status_code)
+                raise TransientHTTPError(
+                    http_error_msg,
+                    status_code=response.status_code,
+                    retry_after=retry_after_seconds(response.headers.get('Retry-After')),
+                )
 
             raise curl_cffi_exceptions.HTTPError(http_error_msg, response=response)
 
@@ -588,9 +668,7 @@ class UrlJob(UrlJobBase):
 
         return data, etag, mime_type
 
-    def retrieve(  # noqa: C901 mccabe complexity too high
-        self, job_state: JobState, headless: bool = True
-    ) -> tuple[str | bytes, str, str]:
+    def retrieve(self, job_state: JobState, headless: bool = True) -> tuple[str | bytes, str, str]:
         """Runs job to retrieve the data, and returns data, ETag and media type.
 
         :param job_state: The JobState object, to keep track of the state of the retrieval.
@@ -687,28 +765,42 @@ class UrlJob(UrlJobBase):
         logger.debug(f'Job {self.index_number}: Headers: {headers}')
         logger.debug(f'Job {self.index_number}: Cookies: {self.cookies}')
 
-        if self.http_client == 'curl_cffi' or (not self.http_client and not httpx and isinstance(requests, str)):
-            if isinstance(curl_cffi_requests, str):
-                message = f'Job {job_state.job.index_number} cannot be run '
-                if self.http_client == 'curl_cffi':
-                    message += "with 'http_client: curl_cffi' "
-                message += (
-                    f'( {self.get_indexed_location()} ):\n{curl_cffi_requests}\n'
-                    f"Please install module using e.g. 'uv pip install --upgrade webchanges[curl_cffi]'."
-                )
-                raise ImportError(message)
+        if self.http_client == 'curl_cffi' or (
+            not self.http_client
+            and not httpx  # ty: ignore[redundant-condition]
+            and importlib.util.find_spec('requests') is None
+        ):
+            try:
+                from curl_cffi import requests as curl_cffi_requests  # noqa: F401 imported but unused (checks it loads)
+            except ImportError as e:
+                raise missing_dependency(
+                    e,
+                    'curl_cffi',
+                    used_by=(
+                        "the 'http_client: curl_cffi' job directive"
+                        if self.http_client == 'curl_cffi'
+                        else "retrieving the URL (as neither 'httpx' nor 'requests' is installed)"
+                    ),
+                    extra='curl_cffi',
+                    location=self.get_indexed_location(),
+                ) from e
             job_state._http_client_used = 'curl_cffi'
-            data, etag, mime_type = self._retrieve_curl_cffi(headers=headers, timeout=timeout)
-        elif self.http_client == 'requests' or not httpx:
-            if isinstance(requests, str):
-                message = f'Job {job_state.job.index_number} cannot be run '
-                if self.http_client == 'requests':
-                    message += "with 'http_client: requests "
-                message += (
-                    f'( {self.get_indexed_location()} ):\n{requests}\n'
-                    f"Please install module using e.g. 'uv pip install --upgrade webchanges[requests]'."
-                )
-                raise ImportError(message)
+            retrieve_with_client = self._retrieve_curl_cffi
+        elif self.http_client == 'requests' or not httpx:  # ty: ignore[redundant-condition]
+            try:
+                import requests  # noqa: F401 imported but unused (checks that it loads)
+            except ImportError as e:
+                raise missing_dependency(
+                    e,
+                    'requests',
+                    used_by=(
+                        "the 'http_client: requests' job directive"
+                        if self.http_client == 'requests'
+                        else "retrieving the URL (as 'httpx' is not installed)"
+                    ),
+                    extra='requests',
+                    location=self.get_indexed_location(),
+                ) from e
             if self.http_version is not None:
                 raise ValueError(
                     f"Job {job_state.job.index_number}: 'http_version' is not supported by the 'requests' HTTP "
@@ -716,29 +808,26 @@ class UrlJob(UrlJobBase):
                     f'( {self.get_indexed_location()} ).'
                 )
             job_state._http_client_used = 'requests'
-            data, etag, mime_type = self._retrieve_requests(headers=headers, timeout=timeout)
+            retrieve_with_client = self._retrieve_requests
         elif not self.http_client or self.http_client == 'httpx':
-            if isinstance(httpx, str):
-                message = f'Job {job_state.job.index_number} cannot be run '
-                if self.http_client == 'httpx':
-                    message += "with 'http_client: httpx "
-                message += (
-                    f'( {self.get_indexed_location()} ):\n{httpx}\n'
-                    f"Please install module using e.g. 'uv pip install --upgrade httpx[http2,zstd]'."
+            if httpx is None:  # pragma: no cover  # only reachable with an explicit 'http_client: httpx'
+                raise missing_dependency(
+                    "No module named 'httpx'",
+                    'httpx',
+                    used_by="the 'http_client: httpx' job directive",
+                    location=self.get_indexed_location(),
                 )
-                raise ImportError(message)
             job_state._http_client_used = 'httpx'
-            data, etag, mime_type = self._retrieve_httpx(headers=headers, timeout=timeout)
+            retrieve_with_client = self._retrieve_httpx
         else:
             raise ValueError(
                 f"Job {job_state.job.index_number}: http_client '{self.http_client}' is not supported; cannot run job "
                 f'( {self.get_indexed_location()} )'
             )
 
-        # If empty_as_transient is set and no data, then raise transient error
-        if self.empty_as_transient and not data:
-            logger.info(f'Job {self.index_number}: No data received; treating it as a transient error.')
-            raise TransientHTTPError('No data received and empty_as_transient is set', status_code=999)
+        data, etag, mime_type = self.retrieve_with_retries(retrieve_with_client, headers, timeout)
+
+        # Note: the empty_as_error check is made by JobState.process(), which applies it to every job kind.
 
         # If no name directive is given, set it to the title element if found in HTML or XML truncated to 60 characters
         if not self.name and isinstance(data, str):
@@ -765,21 +854,21 @@ class UrlJob(UrlJobBase):
         :param tb: The traceback.format_exc() string.
         :returns: A string to display and/or use in reports.
         """
+        # An exception of the optional HTTP clients can only have been raised if that client was imported
+        requests = sys.modules.get('requests')
+        curl_cffi_exceptions = sys.modules.get('curl_cffi.requests.exceptions')
         if (
             (
-                httpx
+                httpx  # ty: ignore[redundant-condition]
                 and isinstance(exception, (httpx.HTTPError, httpx.InvalidURL, httpx.CookieConflict, httpx.StreamError))
             )
-            or (not isinstance(requests, str) and isinstance(exception, requests.exceptions.RequestException))
-            or (
-                not isinstance(curl_cffi_exceptions, str)
-                and isinstance(exception, curl_cffi_exceptions.RequestException)
-            )
+            or (requests is not None and isinstance(exception, requests.exceptions.RequestException))
+            or (curl_cffi_exceptions is not None and isinstance(exception, curl_cffi_exceptions.RequestException))
         ):
             # Instead of a full traceback, just show the error
             exception_str = str(exception).strip()
             if self.proxy and (
-                (httpx and isinstance(exception, httpx.TransportError))
+                (httpx and isinstance(exception, httpx.TransportError))  # ty: ignore[redundant-condition]
                 or any(
                     exception_str.startswith(error_string)
                     for error_string in (
@@ -806,7 +895,75 @@ class UrlJob(UrlJobBase):
             ):
                 exception_str += f'\n\n(Job has proxy {self.proxy})'
             return exception_str
-        return tb
+        return super().format_error(exception, tb)
+
+    def retrieve_with_retries(
+        self,
+        retrieve_with_client: Callable[..., tuple[str | bytes, str, str]],
+        headers: Any,  # noqa: ANN401 Dynamically typed expressions Any are disallowed
+        timeout: float | None,
+    ) -> tuple[str | bytes, str, str]:
+        """Retrieves the data with the HTTP client, retrying a transient failure (see :py:meth:`is_transient_error`)
+        as many times as set by the 'retries' directive.
+
+        :param retrieve_with_client: The method retrieving the data with the selected HTTP client.
+        :param headers: The request headers.
+        :param timeout: The request timeout.
+        :returns: The data retrieved, the ETag, and the media type (fka MIME type).
+        """
+        attempts = 1 + max(self.retries or 0, 0)
+        for attempt in range(1, attempts):
+            try:
+                return retrieve_with_client(headers=headers, timeout=timeout)
+            except Exception as e:
+                if not self.is_transient_error(e):
+                    raise
+                wait = self.retry_wait(e, attempt)
+                logger.info(
+                    f'Job {self.index_number}: Attempt {attempt} of {attempts} failed ({type(e).__name__}: {e}); '
+                    f'retrying in {wait:g} seconds (retries directive)'
+                )
+                time.sleep(wait)
+        return retrieve_with_client(headers=headers, timeout=timeout)
+
+    @staticmethod
+    def is_transient_error(exception: Exception) -> bool:
+        """Whether the exception is a failure that a new attempt could overcome (the ones retried by the 'retries'
+        directive): a connection error (e.g. a connection reset by the server), a timeout, or a transient HTTP response
+        (429, 500, 502, 503 or 504), of any of the HTTP clients.
+
+        :param exception: The exception.
+        :returns: True if the request should be retried, False otherwise.
+        """
+        if isinstance(exception, TransientHTTPError):
+            return exception.status_code != EMPTY_RESPONSE_STATUS_CODE
+        # An exception of the optional HTTP clients can only have been raised if that client was imported
+        requests = sys.modules.get('requests')
+        curl_cffi_exceptions = sys.modules.get('curl_cffi.requests.exceptions')
+        return bool(
+            (httpx and isinstance(exception, httpx.TransportError))
+            or (
+                requests is not None
+                and isinstance(exception, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+            )
+            or (
+                curl_cffi_exceptions is not None
+                and isinstance(exception, (curl_cffi_exceptions.ConnectionError, curl_cffi_exceptions.Timeout))
+            )
+        )
+
+    @staticmethod
+    def retry_wait(exception: Exception, attempt: int) -> float:
+        """The number of seconds to wait before the next attempt: the server's Retry-After (if any) up to
+        RETRY_AFTER_MAX, otherwise an exponential backoff (1, 2, 4, ... seconds) up to RETRY_BACKOFF_MAX.
+
+        :param exception: The exception raised by the failed attempt.
+        :param attempt: The number of the failed attempt (starting at 1).
+        :returns: The number of seconds to wait.
+        """
+        if isinstance(exception, TransientHTTPError) and exception.retry_after is not None:
+            return min(exception.retry_after, RETRY_AFTER_MAX)
+        return min(2.0 ** (attempt - 1), RETRY_BACKOFF_MAX)
 
     def ignore_error(self, exception: Exception) -> bool:
         """Determine whether the error of the job should be ignored.
@@ -814,15 +971,32 @@ class UrlJob(UrlJobBase):
         :param exception: The exception.
         :returns: True if the error should be ignored, False otherwise.
         """
-        if httpx and isinstance(exception, (httpx.HTTPError, TransientHTTPError)):
+
+        def is_connection_error(exception: Exception, *client_errors: type[BaseException]) -> bool:
+            """Whether the exception is a connection error of the HTTP client, or a transient HTTP response other
+            than the synthetic one of the empty_as_error directive (the server did respond, so an empty response is
+            not a connection problem and must not be silenced by ignore_connection_errors).
+            """
+            if isinstance(exception, TransientHTTPError):
+                return exception.status_code != EMPTY_RESPONSE_STATUS_CODE
+            return isinstance(exception, client_errors)
+
+        # An exception of the optional HTTP clients can only have been raised if that client was imported
+        requests = sys.modules.get('requests')
+        curl_cffi_exceptions = sys.modules.get('curl_cffi.requests.exceptions')
+
+        if httpx and isinstance(exception, (httpx.HTTPError, TransientHTTPError)):  # ty: ignore[redundant-condition]
             if self.ignore_timeout_errors and (
                 isinstance(exception, httpx.TimeoutException)
                 or (isinstance(exception, TransientHTTPError) and exception.status_code == 504)
             ):
                 return True
-            if self.ignore_connection_errors and isinstance(exception, (httpx.TransportError, TransientHTTPError)):
+            if self.ignore_connection_errors and is_connection_error(exception, httpx.TransportError):
                 return True
             if self.ignore_too_many_redirects and isinstance(exception, httpx.TooManyRedirects):
+                return True
+            # The server closed the connection before sending the complete response body.
+            if self.ignore_incomplete_reads and isinstance(exception, httpx.RemoteProtocolError):
                 return True
             if self.ignore_http_error_codes:
                 if isinstance(exception, httpx.HTTPStatusError):
@@ -830,19 +1004,17 @@ class UrlJob(UrlJobBase):
                 if isinstance(exception, TransientHTTPError):
                     return self._ignore_http_error_code(exception.status_code)
 
-        elif not isinstance(requests, str) and isinstance(
-            exception, (requests.exceptions.RequestException, TransientHTTPError)
-        ):
+        elif requests is not None and isinstance(exception, (requests.exceptions.RequestException, TransientHTTPError)):
             if self.ignore_timeout_errors and (
                 isinstance(exception, requests.exceptions.Timeout)
                 or (isinstance(exception, TransientHTTPError) and exception.status_code == 504)
             ):
                 return True
-            if self.ignore_connection_errors and (
-                isinstance(exception, (requests.exceptions.ConnectionError, TransientHTTPError))
-            ):
+            if self.ignore_connection_errors and is_connection_error(exception, requests.exceptions.ConnectionError):
                 return True
             if self.ignore_too_many_redirects and isinstance(exception, requests.exceptions.TooManyRedirects):
+                return True
+            if self.ignore_incomplete_reads and isinstance(exception, requests.exceptions.ChunkedEncodingError):
                 return True
             if self.ignore_http_error_codes:
                 if isinstance(exception, requests.exceptions.HTTPError) and exception.response is not None:
@@ -850,7 +1022,7 @@ class UrlJob(UrlJobBase):
                 if isinstance(exception, TransientHTTPError):
                     return self._ignore_http_error_code(exception.status_code)
 
-        elif not isinstance(curl_cffi_exceptions, str) and isinstance(
+        elif curl_cffi_exceptions is not None and isinstance(
             exception, (curl_cffi_exceptions.RequestException, TransientHTTPError)
         ):
             if self.ignore_timeout_errors and (
@@ -858,11 +1030,13 @@ class UrlJob(UrlJobBase):
                 or (isinstance(exception, TransientHTTPError) and exception.status_code == 504)
             ):
                 return True
-            if self.ignore_connection_errors and (
-                isinstance(exception, (curl_cffi_exceptions.ConnectionError, TransientHTTPError))
-            ):
+            if self.ignore_connection_errors and is_connection_error(exception, curl_cffi_exceptions.ConnectionError):
                 return True
             if self.ignore_too_many_redirects and isinstance(exception, curl_cffi_exceptions.TooManyRedirects):
+                return True
+            if self.ignore_incomplete_reads and isinstance(
+                exception, (curl_cffi_exceptions.ChunkedEncodingError, curl_cffi_exceptions.IncompleteRead)
+            ):
                 return True
             if self.ignore_http_error_codes:
                 if isinstance(exception, curl_cffi_exceptions.HTTPError) and exception.response is not None:

@@ -46,8 +46,6 @@ square brackets, like this::
 | ``imagediff`` differ    | * `Pillow <https://python-pillow.org>`__                                |
 +-------------------------+-------------------------------------------------------------------------+
 | ``jq`` filter           | * `jq <https://github.com/mwilliamson/jq.py>`__                         |
-|                         | * **Only available for Linux and macOS** (Windows installation is       |
-|                         |   incomplete)                                                           |
 +-------------------------+-------------------------------------------------------------------------+
 | ``ocr`` filter          | * `pytesseract <https://github.com/madmaze/pytesseract>`__              |
 |                         | * Note: requires Tesseract to be **separately installed** [#f4]_        |
@@ -56,6 +54,9 @@ square brackets, like this::
 | ``pdf2text`` filter     | * `pdftotext <https://github.com/jalan/pdftotext>`__                    |
 |                         | * Note: you will also have to **separately install** OS-specific        |
 |                         |   dependencies [#f5]_                                                   |
++-------------------------+-------------------------------------------------------------------------+
+| ``xmltojson`` and       | * `xmltodict <https://github.com/martinblech/xmltodict>`__              |
+| ``xmltoyaml`` filters   |                                                                         |
 +-------------------------+-------------------------------------------------------------------------+
 | ``pypdf`` filter        | * `pypdf <https://pypi.org/project/pypdf/>`__                           |
 |                         | * Note: for PDF files that are not password-protected (otherwise use    |
@@ -116,11 +117,12 @@ Installed packages
 ------------------
 These Python packages are installed automatically by :program:`pip` when installing :program:`webchanges`:
 
-* `colorama <https://github.com/tartley/colorama>`__ (only in Windows installations);
 * `cssselect <https://github.com/scrapy/cssselect>`__ (required by lxml.cssselect);
 * `h2 <https://github.com/python-hyper/h2>`__;
 * `html2text <https://github.com/Alir3z4/html2text>`__;
-* `httpx <https://github.com/encode/httpx>`__;
+* `httpx <https://github.com/encode/httpx>`__ (the HTTP client; if it is removed, :program:`webchanges` uses
+  ``requests`` or, failing that, ``curl_cffi``, except for the :ref:`ai_google <ai_google_diff>` differ, which
+  requires ``httpx``);
 * `lxml <https://lxml.de>`__;
 * `markdown2 <https://github.com/trentm/python-markdown2>`__;
 * `msgpack <https://msgpack.org/>`__;

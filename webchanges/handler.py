@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = ['subprocess', 'traceback', 'zoneinfo']
+
 import logging
 import os
 import subprocess
@@ -15,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from webchanges.differs import DifferBase, ReportKind
 from webchanges.filters import FilterBase
-from webchanges.jobs import NotModifiedError
+from webchanges.jobs import EMPTY_RESPONSE_STATUS_CODE, NotModifiedError, TransientHTTPError
 from webchanges.reporters import ReporterBase
 
 # https://stackoverflow.com/questions/39740632
@@ -89,6 +91,7 @@ class JobState(ContextManager):
     old_etag: str = ''
     old_mime_type: str = 'text/plain'
     old_timestamp: float = 1605147837.511478  # initialized to the first release of webchanges!
+    reported_count: int = 0  # the number of reporters this job was submitted to (see ReporterBase.submit_one)
     traceback: str
     tries: int = 0  # if >1, an error; value is the consecutive number of runs leading to an error
     unfiltered_diff: dict[ReportKind, str]
@@ -108,19 +111,10 @@ class JobState(ContextManager):
         self.history_dic_snapshots = {}
 
     def __enter__(self) -> Self:
-        """Context manager invoked on entry to the body of a with statement to make it possible to factor out standard
-        uses of try/finally statements. Calls the main_thread_enter method of the Job.
+        """Context manager invoked on entry to the body of a with statement.
 
         :returns: Class object.
         """
-        # Below is legacy code that now does nothing, so it's being skipped
-        # try:
-        #     self.job.main_thread_enter()
-        # except Exception as e:
-        #     logger.info(f'Job {self.job.index_number}: Exception while creating resources for job', exc_info=True)
-        #     self.exception = e
-        #     self.traceback = self.job.format_error(e, traceback.format_exc())
-
         return self
 
     def __exit__(
@@ -129,21 +123,10 @@ class JobState(ContextManager):
         exc_value: BaseException | None,
         tb: TracebackType | None,
     ) -> bool | None:
-        """Context manager invoked on exit from the body of a with statement to make it possible to factor out standard
-        uses of try/finally statements. Calls the main_thread_exit() method of the Job.
+        """Context manager invoked on exit from the body of a with statement.
 
         :returns: None.
         """
-        # Below is legacy code that now does nothing, so it's being skipped
-        # try:
-        #     self.job.main_thread_exit()
-        # except Exception:
-        #     # We don't want exceptions from releasing resources to override job run results
-        #     logger.warning(f'Job {self.index_number}: Exception while releasing resources for job', exc_info=True)
-        # if isinstance(exc_value, subprocess.CalledProcessError):
-        #     raise subprocess.SubprocessError(exc_value.stderr)
-        # elif isinstance(exc_value, FileNotFoundError):
-        #     raise OSError(exc_value)
         return None
 
     @staticmethod
@@ -205,6 +188,18 @@ class JobState(ContextManager):
         """Removes the last instance in the snapshot database."""
         self.snapshots_db.delete_latest(guid=self.job.guid, temporary=temporary)
 
+    def _raise_if_empty(self, data: str | bytes, what: str) -> None:
+        """Raises the error of the empty_as_error directive if the data is empty or consists only of whitespace.
+
+        :param data: The data retrieved or filtered.
+        :param what: The description of the condition, used in the log and in the error message.
+        :raises TransientHTTPError: With the synthetic status code EMPTY_RESPONSE_STATUS_CODE, if the data is empty.
+        """
+        stripped = data.strip() if isinstance(data, (str, bytes)) else data
+        if not stripped:
+            logger.info('Job %s: %s; treating it as an error.', self.job.index_number, what)
+            raise TransientHTTPError(f'{what} and empty_as_error is set', status_code=EMPTY_RESPONSE_STATUS_CODE)
+
     def process(self, headless: bool = True) -> JobState:
         """Processes the job: loads it (i.e. runs it) and handles Exceptions (errors).
 
@@ -230,12 +225,24 @@ class JobState(ContextManager):
                 f'Job {self.job.index_number}: Retrieved data={data!r} | etag={self.new_etag} | mime_type={mime_type}'
             )
 
+            # An empty (or whitespace-only) response is treated as an error when empty_as_error is set, so that the
+            # last non-empty snapshot is retained instead of being overwritten. The check is made here, before
+            # filtering, so that it applies to every job kind including those defined in hooks.py, and again after
+            # filtering, as a filter (e.g. an xpath matching nothing on a page that did not render fully) can leave
+            # nothing. BrowserJob makes its own, earlier check against the raw network body, as its rendered page
+            # source is never empty.
+            if self.job.empty_as_error:
+                self._raise_if_empty(data, 'No data received')
+
             # Apply automatic filters first
             filtered_data, mime_type = FilterBase.auto_process(self, data, mime_type)
 
             # Apply any specified filters
-            for filter_kind, subfilter in FilterBase.normalize_filter_list(self.job.filters, self.job.index_number):  # ty:ignore[invalid-argument-type]
+            for filter_kind, subfilter in FilterBase.normalize_filter_list(self.job.filters, self.job.index_number):
                 filtered_data, mime_type = FilterBase.process(filter_kind, subfilter, self, filtered_data, mime_type)
+
+            if self.job.empty_as_error:
+                self._raise_if_empty(filtered_data, 'No data left after filtering')
 
             self.new_data = filtered_data
             self.new_mime_type = mime_type
@@ -244,6 +251,11 @@ class JobState(ContextManager):
             # HTTP 304 response has been received
             self.exception = e
             self.error_ignored = False
+            # Nothing was retrieved, so carry the last snapshot forward: worker.run_jobs saves the job state when a
+            # 304 arrives after a failed run (to reset 'tries'), and save() would otherwise store the empty new_data.
+            self.new_data = self.old_data
+            self.new_etag = self.old_etag
+            self.new_mime_type = self.old_mime_type
         except Exception as e:
             # Processing error of job failed its chance to handle error
             # Job has a chance to format and ignore its error
@@ -251,7 +263,11 @@ class JobState(ContextManager):
                 logger.warning('Running in a debugging session: raising the exception instead of processing it')
                 raise
             self.exception = e
-            self.error_ignored = self.job.ignore_error(e)
+            self.error_ignored = self.job.ignore_error(e) or (
+                self.job.empty_as_error == 'ignore'
+                and isinstance(e, TransientHTTPError)
+                and e.status_code == EMPTY_RESPONSE_STATUS_CODE
+            )
             if not self.error_ignored:
                 self.new_timestamp = time.time()
                 # Check for specific exception types to provide more detailed tracebacks
@@ -324,11 +340,16 @@ class JobState(ContextManager):
         """Returns whether the new data is in markdown."""
         return self.new_mime_type == 'text/markdown' or bool(self.job.is_markdown)
 
+    def is_rst(self) -> bool:
+        """Returns whether the new data is in rst."""
+        return self.new_mime_type == 'text/x-rst' or bool(self.job.is_rst)
+
 
 class Report:
     """The base class for reporting."""
 
     new_release_future: Future[str | bool] | None = None
+    reporters_enabled: bool = False  # set by finish()/finish_one(): whether at least one reporter ran
     start: float = time.perf_counter()
 
     def __init__(self, urlwatch: Urlwatch) -> None:
@@ -490,19 +511,28 @@ class Report:
         end = time.perf_counter()
         duration = end - self.start
 
-        ReporterBase.submit_all(self, self.job_states, duration, jobs_file)
+        self.reporters_enabled = ReporterBase.submit_all(self, self.job_states, duration, jobs_file)
 
-    def finish_one(self, name: str, jobs_file: list[Path] | None = None, check_enabled: bool | None = True) -> None:
+    def finish_one(
+        self,
+        name: str,
+        jobs_file: list[Path] | None = None,
+        check_enabled: bool | None = True,
+        apply_tags: bool = True,
+    ) -> None:
         """Finish job run of one: determine its duration and generate reports by submitting job_states to
         :py:Class:`ReporterBase` :py:func:`submit_one`.  Used in testing.
 
         :param name: The name of the reporter to run.
         :param jobs_file: The path to the file containing the list of jobs (optional, used in footers).
         :param check_enabled: If True (default), run reports only if they are enabled in the configuration.
+        :param apply_tags: If True (default), honor the 'tags' directive of the reporter's configuration(s).
         """
         end = time.perf_counter()
         duration = end - self.start
         if jobs_file is None:
             jobs_file = []
 
-        ReporterBase.submit_one(name, self, self.job_states, duration, jobs_file, check_enabled)
+        self.reporters_enabled = ReporterBase.submit_one(
+            name, self, self.job_states, duration, jobs_file, check_enabled, apply_tags
+        )

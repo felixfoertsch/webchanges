@@ -4,9 +4,33 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = [
+    'base64',
+    'concurrent.futures',
+    'datetime',
+    'difflib',
+    'html',
+    'html2text',
+    'importlib.util',
+    'io',
+    'json',
+    'math',
+    'pathlib',
+    'shlex',
+    'subprocess',
+    'tempfile',
+    'time',
+    'traceback',
+    'urllib.parse',
+    'warnings',
+    'xml.parsers.expat',
+    'yaml',
+]
+
 import base64
 import difflib
 import html
+import importlib.util
 import logging
 import math
 import os
@@ -24,56 +48,39 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, tzinfo
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Iterator, Literal, NoReturn, TypedDict
 from xml.parsers.expat import ExpatError
 
 import html2text
 import yaml
 
-from webchanges.util import TrackSubClasses, linkify, mark_to_html
+from webchanges.util import TrackSubClasses, linkify, mark_to_html, missing_dependency
 
 if TYPE_CHECKING:
     from webchanges.jobs import JobBase
 
 
-try:
-    from deepdiff import DeepDiff
-
-    if TYPE_CHECKING:
-        from deepdiff.model import DiffLevel
-except ImportError as e:  # pragma: no cover
-    DeepDiff = str(e)  # ty:ignore[invalid-assignment]
-
-
+# Optional dependencies (deepdiff, xmltodict, Pillow, numpy) are imported inside the differs that use them, so that only
+# the runs that need them pay for importing them (see missing_dependency() in webchanges/util.py). The fallback
+# assignment below is hidden from the type checker behind `if not TYPE_CHECKING` (see webchanges/jobs/_url.py).
 try:
     import httpx
 except ImportError:  # pragma: no cover
-    httpx = None  # ty:ignore[invalid-assignment]
+    if not TYPE_CHECKING:
+        httpx = None
 if httpx is not None:
     try:
         import h2
     except ImportError:  # pragma: no cover
-        h2 = None  # ty:ignore[invalid-assignment]
-
-try:
-    import numpy as np
-except ImportError as e:  # pragma: no cover
-    np = str(e)  # ty:ignore[invalid-assignment]
-
-try:
-    from PIL import Image, ImageChops, ImageEnhance, ImageStat
-except ImportError as e:  # pragma: no cover
-    Image = str(e)  # ty:ignore[invalid-assignment]
+        h2 = None
 
 import json
 
-try:
-    import xmltodict
-except ImportError as e:  # pragma: no cover
-    xmltodict = str(e)  # ty:ignore[invalid-assignment]
-
 # https://stackoverflow.com/questions/39740632
 if TYPE_CHECKING:
+    from deepdiff.model import DiffLevel
+    from PIL import Image
+
     from webchanges.handler import JobState
     from webchanges.storage import _ConfigDifferDefaults
 
@@ -229,11 +236,16 @@ def _ai_google_post_with_retry(
         **kwargs: Additional keyword arguments passed to ``http_client.post``.
 
     Returns:
-        The final httpx response (the first success, or the last response once retrying stops).
+        The final httpx response (the first success, or the last response once retrying stops). The number of retries
+        made and the cumulative seconds slept are recorded in ``response.extensions`` under the keys
+        ``'webchanges_retries'`` and ``'webchanges_total_wait'``, so that callers can report them.
     """
     total_wait = 0.0
+    retries = 0
     while True:
         response = http_client.post(url, **kwargs)
+        response.extensions['webchanges_retries'] = retries
+        response.extensions['webchanges_total_wait'] = total_wait
         logger.debug(f'Job {job.index_number}: Google AI POST to {response.url.host} returned {response.status_code}')
         wait = _ai_google_retry_wait(response)
         if wait is None:
@@ -251,6 +263,7 @@ def _ai_google_post_with_retry(
             )
             break
         total_wait += wait
+        retries += 1
         logger.info(
             f'Job {job.index_number}: Google AI returned {response.status_code}; retrying in {wait:.1f}s '
             f'(cumulative wait {total_wait:.1f}s of {AI_GOOGLE_MAX_TOTAL_WAIT}s max)'
@@ -543,17 +556,23 @@ class DifferBase(metaclass=TrackSubClasses):
         parser.wrap_links = False
         return '\n'.join(line.rstrip() for line in parser.handle(data).splitlines())
 
-    def raise_import_error(self, package_name: str, error_message: str) -> None:
-        """Raise ImportError for missing package.
+    def raise_import_error(
+        self, package_name: str, error_message: ImportError | str, extra: str | None = None
+    ) -> NoReturn:
+        """Raise the standard ImportError for a package that the differ needs but cannot be imported.
 
-        :param package_name: The name of the module/package that could not be imported.
-        :param error_message: The error message from ImportError.
+        :param package_name: The name to install the package with (e.g. 'pillow', not 'PIL').
+        :param error_message: The ImportError raised when importing the package (or its message).
+        :param extra: The webchanges extra that installs the package, if any (e.g. 'deepdiff' for webchanges[deepdiff]).
 
         :raises: ImportError.
         """
-        raise ImportError(
-            f"Job {self.job.index_number}: Python package '{package_name}' is not installed; cannot use "
-            f"'differ: {self.__kind__}' ({self.job.get_location()})\n{error_message}"
+        raise missing_dependency(
+            error_message,
+            package_name,
+            used_by=f"the '{self.__kind__}' differ",
+            extra=extra,
+            location=self.job.get_indexed_location(),
         )
 
 
@@ -605,7 +624,7 @@ class UnifiedDiffer(DifferBase):
 
             if line_num > 1 and line[0] != '@':  # don't apply to headers or range information
                 if is_markdown or line[0] == '/':  # our informational header
-                    line = mark_to_html(line[1:], self.job.markdown_padded_tables)
+                    line = mark_to_html(line[1:], self.job.markdown_padded_tables, self.job.markdown_extras)
                 else:
                     line = linkify(line[1:])
             return f'<tr><td{style}>{line}</td></tr>'
@@ -751,6 +770,9 @@ class TableDiffer(DifferBase):
             table = table.replace('<th ', '<th style="font-family:monospace" ')
             table = table.replace('<td ', '<td style="font-family:monospace" ')
             table = table.replace(' nowrap="nowrap"', '')
+            # Python 3.15+ marks changed cells with this class, which has no style rule (not even in difflib's own
+            # stylesheet, which isn't used here); remove it so the output is the same on every Python version.
+            table = table.replace(' class="diff_changed"', '')
             table = table.replace('<a ', '<a style="font-family:monospace;color:inherit" ')
             table = table.replace('<span class="diff_add"', '<span style="color:green;background-color:lightgreen"')
             table = table.replace('<span class="diff_sub"', '<span style="color:red;background-color:lightred"')
@@ -779,10 +801,6 @@ class CommandDiffer(DifferBase):
         'command': 'The command to execute',
         'is_html': 'Whether the output of the command is HTML',
     }
-
-    re_ptags = re.compile(r'^<p>|</p>$')
-    re_htags = re.compile(r'<(/?)h\d>')
-    re_tagend = re.compile(r'<(?!.*<).*>+$')
 
     def differ(
         self,
@@ -1000,9 +1018,10 @@ class DeepdiffDiffer(DifferBase):
         _unfiltered_diff: dict[ReportKind, str] | None = None,
         tz: tzinfo | None = None,
     ) -> dict[ReportKind, str]:
-        if isinstance(DeepDiff, str):  # pragma: no cover
-            self.raise_import_error('deepdiff', DeepDiff)
-            raise RuntimeError  # for type checker
+        try:
+            from deepdiff import DeepDiff
+        except ImportError as e:  # pragma: no cover
+            self.raise_import_error('deepdiff', e, extra='deepdiff')
 
         span_added = f'<span style="{self.css_added_style}">'
         span_deltd = f'<span style="{self.css_deltd_style}">'
@@ -1164,8 +1183,9 @@ class DeepdiffDiffer(DifferBase):
                 """
 
                 def stringify_value(value: Any, value_type: str) -> str:  # noqa: ANN401 Dynamically typed expressions Any are disallowed
+                    extras = self.job.markdown_extras
                     if value_type in {'str', 'int', 'float'}:
-                        return f"'{mark_to_html(str(value))}'"
+                        return f"'{mark_to_html(str(value), extras=extras)}'"
                     if value_type in {'dict', 'list'}:
                         if compact:
                             value_string = yaml.safe_dump(
@@ -1178,10 +1198,10 @@ class DeepdiffDiffer(DifferBase):
                             value_list = value_string.splitlines(keepends=True)
                             if len(value_list) < 2:
                                 return value_string
-                            value_string = mark_to_html('\n    ' + '    '.join(value_list))
+                            value_string = mark_to_html('\n    ' + '    '.join(value_list), extras=extras)
                             return value_string.rstrip()
-                        return mark_to_html(json.dumps(value, ensure_ascii=False, indent=2))
-                    return mark_to_html(str(value))
+                        return mark_to_html(json.dumps(value, ensure_ascii=False, indent=2), extras=extras)
+                    return mark_to_html(str(value), extras=extras)
 
                 type_t1 = type(ddiff.t1).__name__
                 val_t1 = stringify_value(ddiff.t1, type_t1)
@@ -1310,9 +1330,10 @@ class DeepdiffDiffer(DifferBase):
                         'html': f'Differ {self.__kind__} <b>ERROR: {data_label} data is invalid YAML</b>\n{e}',
                     }
             if deserialize_method == 'xml':
-                if isinstance(xmltodict, str):  # pragma: no cover
-                    self.raise_import_error('xmltodict', xmltodict)
-                    raise RuntimeError  # for type checker
+                try:
+                    import xmltodict
+                except ImportError as e:  # pragma: no cover
+                    self.raise_import_error('xmltodict', e, extra='deepdiff_xml')
                 try:
                     return xmltodict.parse(data), None
                 except ExpatError as e:
@@ -1443,19 +1464,30 @@ class ImageDiffer(DifferBase):
             RuntimeWarning,
             stacklevel=1,
         )
-        if isinstance(Image, str):  # pragma: no cover
-            self.raise_import_error('pillow', Image)
-            raise RuntimeError  # for type checker
-        if isinstance(httpx, str):  # pragma: no cover
-            self.raise_import_error('httpx', httpx)
-            raise RuntimeError  # for type checker
+        try:
+            from PIL import Image, ImageChops, ImageEnhance, ImageStat
+        except ImportError as e:  # pragma: no cover
+            self.raise_import_error('pillow', e, extra='imagediff')
 
         def load_image_from_web(url: str) -> Image.Image:
-            """Fetches the image from an url."""
+            """Fetches the image from an url with the first HTTP client available of httpx > requests > curl_cffi."""
             logger.debug(f'Retrieving image from {url}')
-            with httpx.stream('GET', url, timeout=10) as response:
-                response.raise_for_status()
-                return Image.open(BytesIO(b''.join(response.iter_bytes())))
+            if httpx is not None:
+                with httpx.stream('GET', url, timeout=10) as response:
+                    response.raise_for_status()
+                    return Image.open(BytesIO(b''.join(response.iter_bytes())))
+            if importlib.util.find_spec('requests') is not None:  # pragma: no cover
+                import requests
+
+                fallback_response = requests.get(url, timeout=10)
+            else:  # pragma: no cover
+                try:
+                    from curl_cffi import requests as curl_cffi_requests
+                except ImportError as e:
+                    self.raise_import_error('httpx', e)
+                fallback_response = curl_cffi_requests.get(url, timeout=10)
+            fallback_response.raise_for_status()  # pragma: no cover
+            return Image.open(BytesIO(fallback_response.content))  # pragma: no cover
 
         def load_image_from_file(filename: str) -> Image.Image:
             """Load an image from a file."""
@@ -1472,17 +1504,23 @@ class ImageDiffer(DifferBase):
             logger.debug('Retrieving image from an ascii85 string')
             return Image.open(BytesIO(base64.a85decode(ascii85)))
 
-        def compute_diff_image(img1: Image.Image, img2: Image.Image) -> tuple[Image.Image, np.float64 | None]:
+        def compute_diff_image(img1: Image.Image, img2: Image.Image) -> tuple[Image.Image, float | None]:
             """Compute the difference between two images."""
             # Compute the absolute value of the pixel-by-pixel difference between the two images.
             diff_image = ImageChops.difference(img1, img2)
 
-            # Compute the mean squared error between the images
-            if not isinstance(np, str):
-                diff_array = np.array(diff_image)
-                mse_value = np.mean(np.square(diff_array))
-            else:  # pragma: no cover
+            # Compute the mean squared error between the images (optional: needs numpy)
+            try:
+                import numpy as np
+            except ImportError as e:  # pragma: no cover
+                error = missing_dependency(
+                    e, 'numpy', used_by='computing the mean squared error', location=self.job.get_indexed_location()
+                )
+                logger.debug(f'{error} It is not reported.')
                 mse_value = None
+            else:
+                diff_array = np.array(diff_image)
+                mse_value = float(np.mean(np.square(diff_array)))
 
             # Create the diff image by overlaying this difference on a darkened greyscale background
             back_image = img1.convert('L')
@@ -1531,6 +1569,13 @@ class ImageDiffer(DifferBase):
                 RuntimeWarning,
                 stacklevel=1,
             )
+            if httpx is None:  # pragma: no cover  # unlike jobs, the AI summaries have no requests/curl_cffi fallback
+                raise missing_dependency(
+                    "No module named 'httpx'",
+                    'httpx',
+                    used_by=f"the AI summary of the '{self.__kind__}' differ",
+                    location=self.job.get_indexed_location(),
+                )
 
             api_version = '1beta'
             # GOOGLE_AI_API_KEY deprecated end of 2025
@@ -1651,31 +1696,6 @@ class ImageDiffer(DifferBase):
                         '',
                     )
 
-            # system_instructions = (
-            #     'You are a skilled journalist tasked with summarizing the key differences between two versions '
-            #     'of the same image. The audience for your summary is already familiar with the image, so you can'
-            #     'focus on the most significant changes.'
-            # )
-            # model_prompt = (
-            #     'You are a skilled visual analyst tasked with analyzing two versions of an image and summarizing the '
-            #     'key differences between them. The audience for your summary is already familiar with the '
-            #     "image's content, so you should focus only on the most significant differences.\n\n"
-            #     '**Instructions:**\n\n'
-            #     # '1. Carefully examine the yellow areas in the image '
-            #     f"{additional_parts[2]['file_data']['file_uri']}, identify the differences, and describe them.\n"
-            #     f"2. Refer to the old version of the image {additional_parts[0]['file_data']['file_uri']} and the "
-            #     f"new version {additional_parts[1]['file_data']['file_uri']}.\n"
-            #     '3. You are only interested in those differences, such as additions, removals, or alterations, that '
-            #     'modify the intended message or interpretation.\n'
-            #     '4. Summarize the identified differences, except those ignored, in a clear and concise manner, '
-            #     'explaining how the meaning has shifted or evolved in the new version compared to the old version '
-            #     'only when necessary. Be specific and provide examples to illustrate your points when needed.\n'
-            #     '5. If there are only additions to the image, then summarize the additions.\n'
-            #     '6. Use Markdown formatting to structure your summary effectively. Use headings, bullet points, '
-            #     'and other Markdown elements as needed to enhance readability.\n'
-            #     '7. Restrict your analysis and summary to the information provided within these images. Do '
-            #     'not introduce external information or assumptions.\n'
-            # )
             system_instructions = (
                 'You are a meticulous visual comparison agent. Your task is to analyze two images: an "old '
                 'version" and a "new version". Your entire focus is on identifying and listing the concrete, '
@@ -1877,7 +1897,9 @@ class ImageDiffer(DifferBase):
             ),
             'html': '<br>\n'.join(
                 [
-                    mark_to_html(summary, extras={'tables'}).replace('<h2>', '<h3>').replace('</h2>', '</h3>'),
+                    mark_to_html(summary, extras={'tables': None, **(self.job.markdown_extras or {})})
+                    .replace('<h2>', '<h3>')
+                    .replace('</h2>', '</h3>'),
                     '',
                     *htm,
                     '-----',
@@ -1935,6 +1957,13 @@ class AIGoogleDiffer(DifferBase):
         Transient API errors (HTTP 429 rate-limit and 503 service-unavailable) are retried automatically via
         ``_ai_google_post_with_retry`` (up to a cumulative ``AI_GOOGLE_MAX_TOTAL_WAIT`` seconds of waiting).
         """
+        if httpx is None:  # pragma: no cover  # unlike jobs, the AI summaries have no requests/curl_cffi fallback
+            raise missing_dependency(
+                "No module named 'httpx'",
+                'httpx',
+                used_by="the 'ai_google' differ",
+                location=job.get_indexed_location(),
+            )
         api_version = '1beta'
         if directives is None:
             directives = {}
@@ -2049,7 +2078,23 @@ class AIGoogleDiffer(DifferBase):
             )
             if r.content:
                 # summary += f': {r.json().get("error", {}).get("message") or ""}'
-                summary += f': {r.content}'
+                summary += f': `{r.content}`'
+            if r.status_code in (429, 503):
+                # Make it clear whether the transient error persisted through the automatic retries or was never
+                # retried (e.g. the response carried no parseable retry delay).
+                retries = r.extensions.get('webchanges_retries', 0)
+                total_wait = r.extensions.get('webchanges_total_wait', 0.0)
+                if retries:
+                    summary += (
+                        f'\n\nStill failing after {retries} automatic '
+                        f'{"retry" if retries == 1 else "retries"} and {total_wait:.1f} seconds of waiting '
+                        f'(limit {AI_GOOGLE_MAX_TOTAL_WAIT} seconds).'
+                    )
+                else:
+                    summary += (
+                        '\n\nNot retried automatically (the response carried no usable retry delay, or the requested '
+                        f'delay alone exceeded the {AI_GOOGLE_MAX_TOTAL_WAIT}-second limit).'
+                    )
 
         return summary, model_version
 
@@ -2270,7 +2315,9 @@ class AIGoogleDiffer(DifferBase):
             'markdown': (f'{summary}\n\n{unified_report["markdown"]}' + (f'\n* * *\n{footer}' if footer else '')),
             'html': '\n'.join(
                 [
-                    mark_to_html(summary, extras={'tables'}).replace('<h2>', '<h3>').replace('</h2>', '</h3>'),
+                    mark_to_html(summary, extras={'tables': None, **(self.job.markdown_extras or {})})
+                    .replace('<h2>', '<h3>')
+                    .replace('</h2>', '</h3>'),
                     '<br>',
                     '<br>',
                     unified_report['html'],
@@ -2555,36 +2602,6 @@ class WdiffDiffer(DifferBase):
                     result_text.append('\n')
                     result_html.append('\n')
 
-        # def append_chunk(tokens: list[str], ansi_color: str | None, html_start: str | None) -> None:
-        #     """
-        #     Appends tokens to results. If style is provided, wraps tokens in style.
-        #     Breaks style application at newlines (<\\n>) to maintain clean output formatting.
-        #     """
-        #     current_line_tokens = []
-
-        #     def flush() -> None:
-        #         if current_line_tokens:
-        #             # Join tokens with space for this segment
-        #             segment = ' '.join(current_line_tokens)
-
-        #             if ansi_color:
-        #                 result_text.append(f'{ansi_color}{segment}{ansi_end}')
-        #                 result_html.append(f'{html_start}{segment}{html_end}')
-        #             else:
-        #                 result_text.append(segment)
-        #                 result_html.append(segment)
-        #             current_line_tokens.clear()
-
-        #     for token in tokens:
-        #         if token == '<\\n>':
-        #             flush()
-        #             # Append newline marker without styling
-        #             result_text.append('<\\n>')
-        #             result_html.append('<\\n>')
-        #         else:
-        #             current_line_tokens.append(token)
-        #     flush()
-
         # Process the diff opcodes
         for tag, i1, i2, j1, j2 in diff.get_opcodes():
             """
@@ -2755,7 +2772,11 @@ class WdiffDiffer(DifferBase):
         if self.state.is_markdown():
             diff_text = diff_text.replace('</s>', ' ')
             diff_html = diff_html.replace('</s>', ' ')
-            diff_html = mark_to_html(diff_html, self.job.markdown_padded_tables).replace('<p>', '').replace('</p>', '')
+            diff_html = (
+                mark_to_html(diff_html, self.job.markdown_padded_tables, self.job.markdown_extras)
+                .replace('<p>', '')
+                .replace('</p>', '')
+            )
 
         if self.job.monospace:
             diff_html = f'<span style="font-family:monospace;white-space:pre-wrap">{diff_html}</span>'

@@ -23,10 +23,33 @@ Add job index number(s) (a "joblist") to the command line to run a subset of job
 will only run jobs #2, #3, and #9, and ``webchanges -1`` will only run the last job. Find the index numbering of your
 jobs by running ``webchanges --list``.
 
+Wherever a command line argument takes a job, you can also select it by its ``name``, its URL (or
+``user_visible_url``) or its command, e.g. ``webchanges --test "Example news"``. If more than one job matches, the
+error message lists them; select the one you want by its index number instead. A job selected more than once in a
+joblist runs only once.
+
 .. versionadded:: 3.6
 
 .. versionchanged:: 3.8
    Accepts negative indices.
+
+.. versionchanged:: 3.39
+   Jobs can be selected by their ``name``; a query matching more than one job is an error.
+
+
+.. _tags_cli:
+
+Select subset of jobs by tag
+----------------------------
+Use ``--tags`` to run only the jobs having any of the tags listed in their :ref:`tags <tags>` job directive; for
+example, ``webchanges --tags personal`` will only run the jobs tagged ``personal``. The argument takes a
+comma-separated list of tags and can be repeated, so ``webchanges --tags personal,team`` and ``webchanges --tags
+personal --tags team`` are equivalent and both run the jobs tagged ``personal`` **or** ``team``.
+
+Jobs without a ``tags`` directive are never selected by ``--tags``. When combined with a joblist, both restrictions
+apply.
+
+.. versionadded:: 3.38
 
 
 .. _cli_jobs:
@@ -37,12 +60,13 @@ Custom job file specification
 By default, the job file is named ``jobs.yaml`` and is located in the following directory:
 
 * Linux: ``~/.config/webchanges``
-* macOS: ``~/Library/Preferences/webchanges``
+* macOS: ``~/Library/Application Support/webchanges``
 * Windows: ``%USERPROFILE%\Documents\webchanges`` (the webchanges folder within your Documents folder)
 
-Use the ``--jobs`` command line argument to specify a file with a different name or location or a `glob pattern
-<https://en.wikipedia.org/wiki/Glob_(programming)>`__ for multiple files (the contents of matching files will be
-combined)
+Use the ``--jobs`` command line argument to specify a file with a different name or location, a `glob pattern
+<https://en.wikipedia.org/wiki/Glob_(programming)>`__ for multiple files, or a directory for all the ``*.yaml`` files in
+its tree (the contents of the files found will be combined). To avoid typing it at every run, use the ``jobs``
+directive in the configuration file instead (see :ref:`here <config_jobs>`); ``--jobs`` overrides it.
 
 - If you specify a file name without a directory, :program:`webchanges` searches:
   1. The current directory
@@ -59,15 +83,30 @@ combined)
 Multiple job files
 ^^^^^^^^^^^^^^^^^^
 
-To load multiple job files in a single run, glob patterns are supported, as well as repeating the ``--jobs`` argument:
+To load multiple job files in a single run, glob patterns and directories are supported, as well as repeating the
+``--jobs`` argument:
 
-``webchanges --jobs file1.yaml --jobs file2.yaml --jobs morningrun/*.yaml``
+``webchanges --jobs file1.yaml --jobs file2.yaml --jobs morningrun/*.yaml --jobs eveningrun``
 
-The contents of all specified files will be combined by appending them in order.
+A glob pattern can include ``**`` to match any number of subdirectories (e.g. ``--jobs "jobs/**/*.yaml"``), and a
+directory (``eveningrun`` above) stands for all the ``*.yaml`` files in it and in its subdirectories.
+
+The contents of all specified files will be combined by appending them in the order the arguments are given, with the
+files matching the same glob pattern or directory in alphabetical order.
+
+The same applies to the ``--hooks`` argument, where a directory stands for all the ``*.py`` files in its tree.
+
+The command line arguments that rewrite the jobs file (``--enable``, ``--disable``, ``--add``, ``--delete`` and
+``--change-location``) cannot be
+used with multiple jobs files: select the file to modify with ``--jobs`` (which overrides the configuration file's
+``jobs`` directive), e.g. ``webchanges --jobs jobs/news.yaml --delete 3``.
 
 
 .. versionchanged:: 3.25
    Added ability to repeat the argument multiple times.
+
+.. versionchanged:: 3.38
+   Added directories; files are combined in a consistent order (it could previously change from run to run).
 
 
 .. _smart-file-specification:
@@ -108,6 +147,8 @@ The search process is as follows:
     *Example:* ``--hooks myhooks`` will look for ``myhooks``, then ``myhooks.py``, ``hooks-myhooks``, and
     finally ``hooks-myhooks.py``.
 
+This also applies to the ``jobs`` and ``hooks`` directives of the configuration file (see :ref:`here <config_jobs>`).
+
 .. versionchanged::  3.31
    Added prefix and expanded from ``--jobs`` to also include ``--config`` and ``--hooks``.
 
@@ -124,6 +165,38 @@ in a `case-insensitive manner <https://docs.python.org/3/library/re.html#re.I>`_
 
 .. versionchanged:: 3.25
    Added ability to filter list using a RegEx.
+
+
+.. _enable_disable:
+
+Enable or disable a job
+-----------------------
+You can disable a job, so that it is no longer run but stays in the jobs file, with the command line argument
+``--disable`` followed by the job's index number (as per ``--list``), name, or URL/command; ``--enable`` undoes it. For
+example:
+
+.. code-block:: bash
+
+   webchanges --disable 3
+   webchanges --enable "Weather forecast"
+
+These set the job's :ref:`enabled` directive: ``--disable`` sets ``enabled: false``, and ``--enable`` removes the
+directive (or sets ``enabled: true`` if :ref:`job_defaults <job_defaults>` would otherwise keep the job disabled).
+
+.. warning::
+
+   To do so, :program:`webchanges` **rewrites the whole jobs file from the jobs it has loaded, so every remark
+   (comment) in the file is lost**, and so is its formatting: directives are written in a standard order and layout,
+   and deprecated ones with their current names. This cannot be undone. When run from a terminal, you are asked to
+   confirm first.
+
+   To keep your remarks, edit the ``enabled`` directive yourself instead, e.g. with ``webchanges --edit-jobs``.
+
+Nothing is rewritten if the job already is enabled (or disabled). These arguments cannot be used with multiple jobs
+files (see :ref:`here <cli_jobs>`).
+
+.. versionadded:: 3.39
+   For backward compatibility.
 
 
 .. _error:
@@ -242,6 +315,12 @@ the snapshots that have been saved::
 
    webchanges --test-differ 1 2 --test-reporter browser  # run differ for job 1 a maximum of 2 times
 
+
+..tip
+   To see changes in invisible characters, pipe the output to utilities that make characters visible. Here is an
+   example for Linux::
+
+      webchanges --test-differ 1 | cat -A | sed 's/ /·/g'
 
 
 .. versionchanged:: 3.3
@@ -408,6 +487,8 @@ configuration file ``urls.yaml`` will create a new job with no history. Retain h
     webchanges --change-location https://example.org#old https://example.org#new
     # or
     webchanges --change-location old_command new_command
+
+When using multiple jobs files, select the one containing the job with ``--jobs`` (see :ref:`here <cli_jobs>`).
 
 .. versionadded:: 3.13
 

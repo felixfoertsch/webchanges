@@ -4,45 +4,22 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = ['csv', 'io', 'json', 'xml.parsers.expat', 'yaml']
+
 import csv
 import io
 import json
 import logging
 from typing import Any, Literal
+from xml.parsers.expat import ExpatError
 
 import yaml
 
 from webchanges.filters._base import FilterBase
+from webchanges.util import missing_dependency
 
-try:
-    from pypdf import PdfReader
-except ImportError as e:  # pragma: no cover
-    PdfReader = str(e)  # ty:ignore[invalid-assignment]
-
-try:
-    import pdftotext  # ty:ignore[unresolved-import]
-except ImportError as e:  # pragma: has-pdftotext
-    pdftotext = str(e)
-
-try:
-    from PIL import Image
-except ImportError as e:  # pragma: no cover
-    Image = str(e)  # ty:ignore[invalid-assignment]
-
-try:
-    import pytesseract  # ty:ignore[unresolved-import]
-except ImportError as e:  # pragma: has-pytesseract
-    pytesseract = str(e)
-
-try:
-    import vobject.base
-except ImportError as e:  # pragma: no cover
-    vobject = str(e)  # ty:ignore[invalid-assignment]
-
-try:
-    import jq  # ty:ignore[unresolved-import]
-except ImportError as e:  # pragma: has-jq
-    jq = str(e)
+# Optional dependencies (pypdf, pdftotext, Pillow, pytesseract, vobject, jq) are imported inside the filters that use
+# them, so that only the runs that need them pay for importing them (see missing_dependency() in webchanges/util.py).
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +95,10 @@ class PypdfFilter(FilterBase):
                 f'({self.job.get_indexed_location()})'
             )
 
-        if isinstance(PdfReader, str):
-            self.raise_import_error('pypdf', self.__kind__, PdfReader)
+        try:
+            from pypdf import PdfReader
+        except ImportError as e:  # pragma: no cover
+            self.raise_import_error('pypdf', self.__kind__, e, extra='pypdf')
 
         class RenamePypdfFilter(logging.Filter):
             """Function to rename logging name from '_.utils' to 'pypdf_utils'"""
@@ -139,12 +118,14 @@ class PypdfFilter(FilterBase):
         if password:
             try:
                 import cryptography  # noqa: F401 imported but unused
-            except ImportError:  # pragma: no cover
-                self.raise_import_error(
+            except ImportError as e:  # pragma: no cover
+                raise missing_dependency(
+                    e,
                     'cryptography',
-                    f'password sub-directive of {self.__kind__}',
-                    "Please install with 'uv pip install --upgrade webchanges[pypdf_crypto]'",
-                )
+                    used_by=f"the 'password' sub-directive of the '{self.__kind__}' filter",
+                    extra='pypdf_crypto',
+                    location=self.job.get_indexed_location(),
+                ) from e
 
         reader = PdfReader(io.BytesIO(data), password=password)
         logger.info(f'Job {self.job.index_number}: Found {reader.pdf_header} file')
@@ -179,12 +160,14 @@ class Pdf2TextFilter(FilterBase):  # pragma: has-pdftotext
                 f'({self.job.get_indexed_location()})'
             )
 
-        if isinstance(pdftotext, str):
-            self.raise_import_error('pdftotext', self.__kind__, pdftotext)
+        try:
+            import pdftotext  # ty:ignore[unresolved-import]
+        except ImportError as e:  # pragma: has-pdftotext
+            self.raise_import_error('pdftotext', self.__kind__, e, extra='pdf2text')
 
         return (
             '\n'.join(
-                pdftotext.PDF(  # ty:ignore[unresolved-attribute]
+                pdftotext.PDF(
                     io.BytesIO(data),
                     password=subfilter.get('password', ''),
                     raw=subfilter.get('method', False),
@@ -203,8 +186,10 @@ class Ical2TextFilter(FilterBase):
     __no_subfilter__ = True
 
     def filter(self, data: str | bytes, mime_type: str, subfilter: dict[str, Any]) -> tuple[str | bytes, str]:
-        if isinstance(vobject, str):
-            self.raise_import_error('vobject', self.__kind__, vobject)
+        try:
+            import vobject.base
+        except ImportError as e:  # pragma: no cover
+            self.raise_import_error('vobject', self.__kind__, e, extra='ical2text')
 
         result = []
         if isinstance(data, str):
@@ -252,14 +237,18 @@ class OCRFilter(FilterBase):  # pragma: has-pytesseract
         language = subfilter.get('language')
         timeout = int(subfilter.get('timeout', 10))
 
-        if isinstance(Image, str):
-            self.raise_import_error('PIL', self.__kind__, Image)
+        try:
+            from PIL import Image
+        except ImportError as e:  # pragma: no cover
+            self.raise_import_error('pillow', self.__kind__, e, extra='ocr')
 
-        if isinstance(pytesseract, str):
-            self.raise_import_error('pytesseract', self.__kind__, pytesseract)
+        try:
+            import pytesseract  # ty:ignore[unresolved-import]
+        except ImportError as e:  # pragma: has-pytesseract
+            self.raise_import_error('pytesseract', self.__kind__, e, extra='ocr')
 
         return (
-            pytesseract.image_to_string(Image.open(io.BytesIO(data)), lang=language, timeout=timeout).strip(),  # ty:ignore[unresolved-attribute]
+            pytesseract.image_to_string(Image.open(io.BytesIO(data)), lang=language, timeout=timeout).strip(),
             'text/plain',
         )
 
@@ -285,13 +274,28 @@ class JQFilter(FilterBase):  # pragma: has-jq
         except ValueError:
             raise ValueError(f"The 'jq' filter needs valid JSON. ({self.job.get_indexed_location()})")  # noqa: B904
 
-        if isinstance(jq, str):
-            self.raise_import_error('jq', self.__kind__, jq)
+        try:
+            import jq  # ty:ignore[unresolved-import]
+        except ImportError as e:  # pragma: has-jq
+            self.raise_import_error('jq', self.__kind__, e, extra='jq')
 
-        return jq.text(subfilter['query'], jsondata), 'text/plain'  # ty:ignore[unresolved-attribute]
+        return jq.text(subfilter['query'], jsondata), 'text/plain'
         # Unicode solution is below https://github.com/mwilliamson/jq.py/issues/59
         # however it aborts execution(!) during testing
         # return '\n'.join(json.dumps(v, ensure_ascii=False) for v in (jq.compile(subfilter['query'], jsondata)))
+
+
+def _json_layout(subfilter: dict[str, Any], default_indentation: int) -> tuple[int | None, tuple[str, str] | None]:
+    """The json.dumps() layout requested by the 'indentation' and 'compact' sub-directives.
+
+    :param subfilter: The filter's sub-directives.
+    :param default_indentation: The indentation if neither sub-directive is set.
+    :returns: The indent and separators arguments for json.dumps(); with 'compact', no indentation and no whitespace
+       after separators.
+    """
+    if subfilter.get('compact'):
+        return None, (',', ':')
+    return int(subfilter.get('indentation', default_indentation)), None
 
 
 class FormatJsonFilter(FilterBase):
@@ -302,6 +306,7 @@ class FormatJsonFilter(FilterBase):
     __supported_subfilters__: dict[str, str] = {
         'indentation': 'Indentation level for pretty-printing',
         'sort_keys': 'Sort the output of dictionaries by key',
+        'compact': 'Remove all unnecessary whitespace (overrides indentation)',
     }
 
     __default_subfilter__ = 'indentation'
@@ -309,7 +314,7 @@ class FormatJsonFilter(FilterBase):
     def filter(self, data: str | bytes, mime_type: str, subfilter: dict[str, Any]) -> tuple[str | bytes, str]:
         self.job.set_to_monospace()
         sort_keys = subfilter.get('sort_keys', False)
-        indentation = int(subfilter.get('indentation', 4))
+        indentation, separators = _json_layout(subfilter, default_indentation=4)
         try:
             parsed_json = json.loads(data)
         except json.JSONDecodeError as e:
@@ -323,7 +328,9 @@ class FormatJsonFilter(FilterBase):
             )
         if not mime_type.endswith('json'):
             mime_type = 'application/json'
-        return json.dumps(parsed_json, ensure_ascii=False, sort_keys=sort_keys, indent=indentation), mime_type
+        return json.dumps(
+            parsed_json, ensure_ascii=False, sort_keys=sort_keys, indent=indentation, separators=separators
+        ), mime_type
 
 
 class JsontoYamlFilter(FilterBase):
@@ -362,4 +369,67 @@ class JsontoYamlFilter(FilterBase):
                 line_break='\n',
                 sort_keys=False,
             )
+        return yaml_data, 'application/yaml'
+
+
+class XmlToJsonFilter(FilterBase):
+    """Convert XML to formatted JSON (attributes become '@' keys and text '#text'), using xmltodict."""
+
+    __kind__ = 'xmltojson'
+
+    __supported_subfilters__: dict[str, str] = {
+        'indentation': 'Indentation level for pretty-printing',
+        'sort_keys': 'Sort the output of dictionaries by key',
+        'compact': 'Remove all unnecessary whitespace (overrides indentation)',
+    }
+
+    __default_subfilter__ = 'indentation'
+
+    def filter(self, data: str | bytes, mime_type: str, subfilter: dict[str, Any]) -> tuple[str | bytes, str]:
+        try:
+            import xmltodict
+        except ImportError as e:  # pragma: no cover
+            self.raise_import_error('xmltodict', self.__kind__, e, extra='xmltodict')
+
+        self.job.set_to_monospace()
+        sort_keys = subfilter.get('sort_keys', False)
+        indentation, separators = _json_layout(subfilter, default_indentation=4)
+        try:
+            parsed_xml = xmltodict.parse(data, dict_constructor=dict)
+        except ExpatError as e:
+            return f"Filter '{self.__kind__}' returned ExpatError: {e}\n\n{data!s}", mime_type
+        return json.dumps(
+            parsed_xml, ensure_ascii=False, sort_keys=sort_keys, indent=indentation, separators=separators
+        ), 'application/json'
+
+
+class XmlToYamlFilter(FilterBase):
+    """Convert XML to formatted YAML (attributes become '@' keys and text '#text'), using xmltodict.  An alternative to
+    xmltojson.
+    """
+
+    __kind__ = 'xmltoyaml'
+
+    __supported_subfilters__: dict[str, str] = {
+        'indentation': 'Indentation level for pretty-printing',
+    }
+
+    __default_subfilter__ = 'indentation'
+
+    def filter(self, data: str | bytes, mime_type: str, subfilter: dict[str, Any]) -> tuple[str | bytes, str]:
+        try:
+            import xmltodict
+        except ImportError as e:  # pragma: no cover
+            self.raise_import_error('xmltodict', self.__kind__, e, extra='xmltodict')
+
+        self.job.set_to_monospace()
+        indentation = int(subfilter.get('indentation', 2))
+        try:
+            parsed_xml = xmltodict.parse(data, dict_constructor=dict)
+        except ExpatError as e:
+            return f"Filter '{self.__kind__}' returned ExpatError: {e}\n\n{data!s}", mime_type
+        # xmltodict always returns a single dict (the document's root element)
+        yaml_data = yaml.safe_dump(
+            parsed_xml, indent=indentation, width=999, allow_unicode=True, line_break='\n', sort_keys=False
+        )
         return yaml_data, 'application/yaml'

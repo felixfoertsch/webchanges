@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = ['warnings']
+
 import logging
 from typing import TYPE_CHECKING, Any
 from warnings import warn
 
-from webchanges.reporters._base import Headers, MarkdownReporter, TextReporter, chunk_string, httpx
+from webchanges.jobs import UrlJobBase
+from webchanges.reporters._base import MarkdownReporter, TextReporter, chunk_string, httpx
 
 if TYPE_CHECKING:
     from webchanges.reporters._base import Response
@@ -22,10 +25,10 @@ if TYPE_CHECKING:
         _ConfigReportWebhook,
     )
 
-try:
+# The optional dependencies chump and pushbullet.py are imported inside the reporters that use them (see
+# missing_dependency() in webchanges/util.py).
+if TYPE_CHECKING:
     import chump
-except ImportError as e:  # pragma: no cover
-    chump = str(e)  # ty:ignore[invalid-assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +42,12 @@ class IFTTTReport(TextReporter):
 
     def submit(self, **kwargs: Any) -> None:  # ty:ignore[invalid-method-override]
         webhook_url = 'https://maker.ifttt.com/trigger/{event}/with/key/{key}'.format(**self.config)
-        for job_state in self.report.get_filtered_job_states(self.job_states):
-            pretty_name = job_state.job.pretty_name()
-            location = job_state.job.get_location()
-            print(f'submitting {job_state}')
-            with self.http_client as http_client:
+        # One client for all the jobs: a closed httpx client cannot be reopened
+        with self.http_client as http_client:
+            for job_state in self.report.get_filtered_job_states(self.job_states):
+                pretty_name = job_state.job.pretty_name()
+                location = job_state.job.get_location()
+                logger.info('Reporter %s: submitting job %s', self.__kind__, job_state.job.index_number)
                 result = http_client.post(
                     webhook_url,
                     json={
@@ -53,8 +57,8 @@ class IFTTTReport(TextReporter):
                     },
                     timeout=60,
                 )
-            if result.status_code != 200:
-                raise RuntimeError(f'IFTTT error: {result.text}')
+                if result.status_code != 200:
+                    raise RuntimeError(f'IFTTT error: {result.text}')
 
 
 class WebServiceReporter(TextReporter):
@@ -98,13 +102,17 @@ class PushoverReport(WebServiceReporter):
     config: _ConfigReportPushover
 
     def web_service_get(self) -> chump.User:
-        if isinstance(chump, str):
-            self.raise_import_error('chump', self.__kind__, chump)
+        try:
+            import chump
+        except ImportError as e:  # pragma: no cover
+            self.raise_import_error('chump', self.__kind__, e, extra='pushover')
 
         app = chump.Application(self.config['app'])
         return app.get_user(self.config['user'])
 
     def web_service_submit(self, service: chump.User, title: str, body: str) -> None:  # ty:ignore[invalid-method-override]
+        import chump  # availability already checked by web_service_get()
+
         sound = self.config['sound']
         # If device is the empty string or not specified at all, use None to send to all devices
         # (see https://github.com/thp/urlwatch/issues/372)
@@ -136,10 +144,7 @@ class PushbulletReport(WebServiceReporter):
         try:
             from pushbullet import Pushbullet
         except ImportError as e:  # pragma: no cover
-            Pushbullet = str(e)  # noqa: N806 variable should be lowercase  # ty:ignore[invalid-assignment]
-
-        if isinstance(Pushbullet, str):
-            self.raise_import_error('pushbullet', self.__kind__, Pushbullet)
+            self.raise_import_error('pushbullet.py', self.__kind__, e, extra='pushbullet')
 
         return Pushbullet(self.config['api_key'])
 
@@ -179,18 +184,19 @@ class WebhookReporter(TextReporter):
             return None
 
         result = None
-        for chunk in chunk_string(text, self.max_length, numbering=True):
-            res = self.submit_to_webhook(webhook_url, chunk)
-            if res.status_code != 200 or res is None:
-                result = res
+        # One client for all the chunks: a closed httpx client cannot be reopened
+        with self.http_client:
+            for chunk in chunk_string(text, self.max_length, numbering=True):
+                res = self.submit_to_webhook(webhook_url, chunk)
+                if res.status_code != 200 or res is None:
+                    result = res
 
         return result
 
     def submit_to_webhook(self, webhook_url: str, text: str) -> Response:
         logger.debug(f'Sending request to webhook with text: {text}')
         post_data = self.prepare_post_data(text)
-        with self.http_client as http_client:
-            result = http_client.post(webhook_url, json=post_data, timeout=60)
+        result = self.http_client.post(webhook_url, json=post_data, timeout=60)
         try:
             if result.status_code in {200, 204}:
                 logger.info('Webhook server response: ok')
@@ -240,13 +246,17 @@ class SlackReporter(WebhookReporter):
         super().__init__(*args, **kwargs)
 
 
-class ShellReporter(WebhookReporter):
-    """Deprecated; use run_command instead."""
+class MattermostReporter(WebhookReporter):
+    """urlwatch's Mattermost reporter (deprecated); use webhook with 'markdown: true' instead."""
 
-    __kind__ = 'shell'
+    __kind__ = 'mattermost'
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warn("'shell' reporter is deprecated; use 'run_command' instead", DeprecationWarning, stacklevel=1)
+        warn(
+            "'mattermost' reporter is deprecated; replace with 'webhook' and add 'markdown: true'",
+            DeprecationWarning,
+            stacklevel=1,
+        )
         super().__init__(*args, **kwargs)
 
 
@@ -276,10 +286,12 @@ class DiscordReporter(TextReporter):
             return None
 
         result = None
-        for chunk in chunk_string(text, self.max_length, numbering=True):
-            res = self.submit_to_discord(webhook_url, chunk)
-            if res.status_code != 200 or res is None:
-                result = res
+        # One client for all the chunks: a closed httpx client cannot be reopened
+        with self.http_client:
+            for chunk in chunk_string(text, self.max_length, numbering=True):
+                res = self.submit_to_discord(webhook_url, chunk)
+                if res.status_code != 200 or res is None:
+                    result = res
 
         return result
 
@@ -311,8 +323,7 @@ class DiscordReporter(TextReporter):
 
         logger.info(f'Sending Discord request with post_data: {post_data}')
 
-        with self.http_client as http_client:
-            result = http_client.post(webhook_url, json=post_data, timeout=60)
+        result = self.http_client.post(webhook_url, json=post_data, timeout=60)
         try:
             if result.status_code in {200, 204}:
                 logger.info('Discord response: ok')
@@ -393,33 +404,57 @@ class NtfyReporter(TextReporter):
     config: _ConfigReportNtfy
 
     def submit(self, **kwargs: Any) -> None:  # ty:ignore[invalid-method-override]
+        """Publish one message per job to the ntfy topic.
+
+        A failed publication is logged and does not stop the others; the first error is raised once all jobs have
+        been published.
+
+        :raises Exception: The first error encountered when publishing.
+        """
+        from webchanges import __project_name__
+
         topic_url = self.config['topic_url']
-        headers = Headers({})
+        headers: dict[str, str] = {}
         config_priorities = self.config.get('priorities', {})
         if priority := config_priorities.get('default'):
             headers['Priority'] = str(priority)
         if authorization := self.config.get('authorization'):
             headers['Authorization'] = authorization
 
-        for job_state in self.report.get_filtered_job_states(self.job_states):
-            from webchanges import __project_name__
+        first_error: Exception | None = None
+        # The client is closed on leaving the context manager and cannot be reopened, so it wraps the whole loop.
+        with self.http_client as http_client:
+            for job_state in self.report.get_filtered_job_states(self.job_states):
+                title = f'{__project_name__.upper()} {job_state.verb.upper()}: {job_state.job.pretty_name()}'
+                differ = job_state.job.differ or {}
+                content = self._format_content(job_state, differ)
 
-            title = f'{__project_name__.upper()} {job_state.verb.upper()}: {job_state.job.pretty_name()}'
-            differ = job_state.job.differ or {}
-            content = self._format_content(job_state, differ)
+                job_headers = headers.copy()
+                job_headers['Title'] = title
 
-            job_headers = headers.copy()
-            job_headers['Title'] = title
+                if priority := config_priorities.get(job_state.verb.split(',')[0]):
+                    job_headers['Priority'] = str(priority)
 
-            if priority := config_priorities.get(job_state.verb.split(',')[0]):
-                job_headers['Priority'] = priority
+                # Only a URL can be opened (not e.g. the command of a shell job).
+                if isinstance(job_state.job, UrlJobBase):
+                    job_headers['Actions'] = f'view, Open URL, "{job_state.job.get_location()}", clear=true'
 
-            job_headers['Actions'] = f'view, Open URL, "{job_state.job.get_location()}", clear=true'
-
-            if httpx:
-                with self.http_client as http_client:
-                    result = http_client.post(topic_url, headers=job_headers, content=content)
-            else:
-                result = http_client.post(topic_url, headers=job_headers, data=content.encode() if content else None)
-            if result.status_code != 200:
-                raise RuntimeError(f"Failed to publish tp ntfy topic '{topic_url}': {result.text}")
+                logger.debug('Publishing to ntfy topic %s: %s', topic_url, title)
+                try:
+                    if httpx:  # ty: ignore[redundant-condition]
+                        result = http_client.post(topic_url, headers=job_headers, content=content)
+                    else:
+                        # requests encodes str header values as Latin-1, so non-Latin-1 job names need UTF-8 bytes.
+                        result = http_client.post(
+                            topic_url,
+                            headers={key: value.encode() for key, value in job_headers.items()},
+                            data=content.encode() if content else None,
+                        )
+                    if result.status_code != 200:
+                        raise RuntimeError(f"Failed to publish to ntfy topic '{topic_url}': {result.text}")
+                except Exception as e:  # noqa: BLE001 publish the other jobs before raising the first error
+                    logger.error('Failed to publish %s to ntfy topic %s: %s', title, topic_url, e)
+                    if first_error is None:
+                        first_error = e
+        if first_error is not None:
+            raise first_error

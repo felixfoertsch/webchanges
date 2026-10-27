@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = ['concurrent.futures', 'contextlib', 'gc', 'urllib.parse']
+
 import gc
 import logging
 import os
@@ -15,11 +17,10 @@ from typing import TYPE_CHECKING, Callable, Iterable
 from webchanges.command import UrlwatchCommand
 from webchanges.handler import JobState
 from webchanges.jobs import NotModifiedError, TransientHTTPError, UrlJobBase
+from webchanges.util import missing_dependency
 
-try:
-    import psutil
-except ImportError as e:  # pragma: no cover
-    psutil = str(e)  # ty:ignore[invalid-assignment]
+# The optional dependency psutil is imported only when browser jobs are run (see missing_dependency() in
+# webchanges/util.py).
 
 # https://stackoverflow.com/questions/39740632
 if TYPE_CHECKING:
@@ -161,12 +162,15 @@ def run_jobs(urlwatcher: Urlwatch, read_only: bool = False) -> None:
                             job_state.new_mime_type = job_state.old_mime_type
                         if not read_only:
                             job_state.save()
-                        if job_state.new_error_data == job_state.old_error_data:
+                        # The first error reported is never a repeated one, even if the same error was saved by the
+                        # runs whose errors max_tries kept from being reported
+                        if job_state.tries > max(max_tries, 1) and job_state.new_error_data == job_state.old_error_data:
                             urlwatcher.report.error_same_error(job_state)
                         else:
                             urlwatcher.report.error(job_state)
-                elif job_state.old_data or job_state.old_timestamp != 0:
-                    # This is not the first time running this job (we have snapshots)
+                elif job_state.old_data or (job_state.old_timestamp != 0 and not job_state.old_error_data):
+                    # This is not the first time running this job successfully (we have snapshots of data, not only of
+                    # errors)
                     if (
                         job_state.new_data == job_state.old_data
                         or job_state.new_data in job_state.history_dic_snapshots
@@ -181,33 +185,25 @@ def run_jobs(urlwatcher: Urlwatch, read_only: bool = False) -> None:
                         else:
                             urlwatcher.report.unchanged(job_state)
                     else:
-                        # # No exact match to previous snapshot  [fuzzy matching, untested and no longer makes sense]
-                        # if len(job_state.history_dic_snapshots) > 1:
-                        #     # Find the closest fuzzy matching saved snapshot ("good enough") and use it to diff
-                        #     close_matches: list[str] = difflib.get_close_matches(
-                        #         str(job_state.new_data), (str(k) for k in job_state.history_dic_snapshots.keys()), n=1
-                        #     )
-                        #     if close_matches:
-                        #         logger.warning(
-                        #             f'Job {job_state.job.index_number}: Did not find an existing run in the database,
-                        #             f'but fuzzy matched it based on the contents of the data'
-                        #         )
-                        #         job_state.old_data = close_matches[0]
-                        #         job_state.old_timestamp = job_state.history_dic_snapshots[close_matches[0]].timestamp
-                        #         job_state.old_etag = job_state.history_dic_snapshots[close_matches[0]].etag
-                        #         job_state.old_mime_type = job_state.history_dic_snapshots[close_matches[0]].mime_type
-
-                        # It has different data, so we save it
+                        # It has different data, so we save it. We used to do fuzzy matching, but it no longer makes
+                        # sense.
                         job_state.tries = 0
                         if not read_only:
                             job_state.save()
                         urlwatcher.report.changed(job_state)
                 else:
-                    # We have never run this job before (there are no snapshots)
+                    # We have never run this job successfully before (there are no snapshots, or only of errors)
                     job_state.tries = 0
                     if not read_only:
                         job_state.save()
-                    urlwatcher.report.new(job_state)
+                    if job_state.job.treat_new_as_changed:
+                        # Report it as a change from empty content, so that its differ and diff_filters apply
+                        logger.debug(
+                            f'Job {job_state.job.index_number}: New job reported as changed (treat_new_as_changed)'
+                        )
+                        urlwatcher.report.changed(job_state)
+                    else:
+                        urlwatcher.report.new(job_state)
 
     jobs = list(UrlwatchCommand(urlwatcher).jobs_from_joblist())
 
@@ -294,11 +290,12 @@ def get_virt_mem_mib() -> float:
 
     :returns: The amount of virtual memory available in MiB (IEC).
     """
-    if isinstance(psutil, str):
-        raise ImportError(
-            "Error when loading package 'psutil'; cannot use 'use_browser: true'. Please install "
-            f"dependencies with 'pip install webchanges[use_browser]'.\n{psutil}"
-        ) from None
+    try:
+        import psutil
+    except ImportError as e:  # pragma: no cover
+        raise missing_dependency(
+            e, 'psutil', used_by="the 'use_browser: true' job directive", extra='use_browser'
+        ) from e
     try:
         virt_mem: float = psutil.virtual_memory().available
         virt_mem /= 1_048_576

@@ -4,6 +4,19 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = [
+    'collections',
+    'copy',
+    'datetime',
+    'inspect',
+    'io',
+    'types',
+    'warnings',
+    'yaml',
+    'yaml.constructor',
+    'yaml.scanner',
+]
+
 import copy
 import inspect
 import io
@@ -13,14 +26,16 @@ import warnings
 from collections import defaultdict
 from datetime import datetime, timezone
 from types import NoneType
-from typing import TYPE_CHECKING, Any, Sized, TextIO
+from typing import TYPE_CHECKING, Any, Iterable, TextIO, cast
 
 import yaml
+import yaml.constructor
 import yaml.scanner
 
 from webchanges import __docs_url__, __project_name__, __version__
 from webchanges.jobs import JobBase
-from webchanges.reporters import ReporterBase
+from webchanges.jobs._base import cookies_from_dict, headers_from_dict
+from webchanges.reporters import ReporterBase, reporter_configs
 from webchanges.storage._base import BaseYamlFileStorage, JobsBaseFileStorage
 from webchanges.storage._config import DEFAULT_CONFIG, _Config, validate_config
 
@@ -41,14 +56,34 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The legacy (urlwatch) 'job_defaults' keys, which read like job directives, mapped to the job-kind names that replace
+# them.
+LEGACY_JOB_DEFAULTS_KEYS = {
+    'all': 'all_jobs',
+    'url': 'url_jobs',
+    'browser': 'browser_jobs',
+    'command': 'command_jobs',
+    'shell': 'command_jobs',
+}
+
+# The urlwatch reporters that webchanges replaced, mapped to their replacement. They still run, with the defaults of
+# YamlConfigStorage.legacy_reporter_defaults(): 'slack' and 'mattermost' as a 'webhook' (the latter with Markdown),
+# and 'shell' piping the report to its command like urlwatch does.
+LEGACY_REPORTERS = {
+    'slack': 'webhook',
+    'mattermost': "webhook (with 'markdown: true')",
+    'shell': 'run_command',
+}
+
 
 class YamlConfigStorage(BaseYamlFileStorage):
     """Class for configuration file (is a YAML textual file)."""
 
-    config: _Config = {}  # ty:ignore[missing-typed-dict-key]
+    # Empty until load() or write_default_config() populates it; pre-load readers guard with .get().
+    config: _Config = cast('_Config', {})
 
     @staticmethod
-    def dict_deep_difference(d1: _Config, d2: _Config, ignore_underline_keys: bool = False) -> _Config:
+    def dict_deep_difference(d1: _Config, d2: _Config, ignore_underline_keys: bool = False) -> dict[str, Any]:
         """Recursively find elements in the first dict that are not in the second.
 
         :param d1: The first dict.
@@ -57,7 +92,7 @@ class YamlConfigStorage(BaseYamlFileStorage):
         :return: A dict with all the elements on the first dict that are not in the second.
         """
 
-        def _sub_dict_deep_difference(d1_: _Config, d2_: _Config) -> _Config:
+        def _sub_dict_deep_difference(d1_: dict[str, Any], d2_: dict[str, Any]) -> dict[str, Any]:
             """Recursive sub-function to find elements in the first dict that are not in the second.
 
             :param d1_: The first dict.
@@ -66,16 +101,19 @@ class YamlConfigStorage(BaseYamlFileStorage):
             """
             for key, value in d1_.copy().items():
                 if ignore_underline_keys and key.startswith('_'):
-                    d1_.pop(key, None)  # ty:ignore[call-non-callable]
+                    d1_.pop(key, None)
                 elif isinstance(value, dict) and isinstance(d2_.get(key), dict):
-                    _sub_dict_deep_difference(value, d2_[key])  # ty:ignore[invalid-argument-type, invalid-key]
+                    _sub_dict_deep_difference(value, d2_[key])
                     if not len(value):
-                        d1_.pop(key)  # ty:ignore[call-non-callable]
+                        d1_.pop(key)
                 elif key in d2_:
-                    d1_.pop(key)  # ty:ignore[call-non-callable]
+                    d1_.pop(key)
             return d1_
 
-        return _sub_dict_deep_difference(copy.deepcopy(d1), d2)
+        # The helper works on plain dicts (the result is a partial diff, not a valid _Config); the deepcopy makes
+        # popping required TypedDict keys safe.
+        d1_copy = cast('dict[str, Any]', copy.deepcopy(d1))
+        return _sub_dict_deep_difference(d1_copy, cast('dict[str, Any]', d2))
 
     @staticmethod
     def dict_deep_merge(source: _Config, destination: _Config) -> _Config:
@@ -87,7 +125,7 @@ class YamlConfigStorage(BaseYamlFileStorage):
         """
         # https://stackoverflow.com/a/20666342
 
-        def _sub_dict_deep_merge(source_: _Config, destination_: _Config) -> _Config:
+        def _sub_dict_deep_merge(source_: dict[str, Any], destination_: dict[str, Any]) -> dict[str, Any]:
             """Recursive sub-function to merges source_ dict into destination_ dict.
 
             :param source_: The first dict.
@@ -97,22 +135,86 @@ class YamlConfigStorage(BaseYamlFileStorage):
             for key, value in source_.items():
                 if isinstance(value, dict):
                     # get node or create one
-                    node = destination_.setdefault(key, {})  # ty:ignore[no-matching-overload]
-                    _sub_dict_deep_merge(value, node)  # ty:ignore[invalid-argument-type]
+                    node = destination_.setdefault(key, {})
+                    _sub_dict_deep_merge(value, node)
                 else:
-                    destination_[key] = value  # ty:ignore[invalid-key]
+                    destination_[key] = value
 
             return destination_
 
-        return _sub_dict_deep_merge(source, copy.deepcopy(destination))
+        # The helper works on plain dicts (source may be a partial diff, not a valid _Config); the deepcopy makes
+        # writing arbitrary TypedDict keys safe.
+        destination_copy = cast('dict[str, Any]', copy.deepcopy(destination))
+        return cast('_Config', _sub_dict_deep_merge(cast('dict[str, Any]', source), destination_copy))
 
     @staticmethod
-    def remove_deprecated_keys(config: _Config) -> _Config:
-        """Remove deprecated keys from config."""
-        if 'slack' in config.get('report', {}):
-            # Ignore legacy key
-            config['report'].pop('slack')  # ty:ignore[invalid-key]
-        return config
+    def legacy_reporter_defaults(name: str) -> dict[str, Any]:
+        """Returns the default sub-directives of one of the LEGACY_REPORTERS.
+
+        :param name: The name of the reporter.
+        :returns: Its default sub-directives.
+        """
+        if name == 'shell':
+            return {'enabled': False, 'command': '', 'ignore_stdout': True, 'ignore_stderr': False}
+        defaults = cast('dict[str, Any]', copy.deepcopy(DEFAULT_CONFIG['report']['webhook']))
+        if name == 'mattermost':
+            defaults['markdown'] = True
+        return defaults
+
+    def fill_legacy_reporters(self, config: _Config) -> None:
+        """Fill in the default sub-directives of the urlwatch reporters in LEGACY_REPORTERS found in the configuration
+        (they are not in DEFAULT_CONFIG, so that they are not written into new configuration files), and warn about
+        those enabled.
+
+        :param config: The configuration; the reporters' configurations are replaced in place.
+        """
+        report = cast('dict[str, Any]', config.get('report', {}))
+        for name, replacement in LEGACY_REPORTERS.items():
+            if name not in report:
+                continue
+            defaults = self.legacy_reporter_defaults(name)
+            cfgs = report[name]
+            filled = [
+                self.dict_deep_merge(cast('_Config', cfg or {}), cast('_Config', defaults))
+                for cfg in (cfgs if isinstance(cfgs, list) else [cfgs])
+            ]
+            report[name] = filled if isinstance(cfgs, list) else filled[0]
+            if any(cast('dict[str, Any]', cfg).get('enabled') for cfg in filled):
+                logger.warning(
+                    "Reporter '%s' of the configuration file %s is deprecated (it comes from urlwatch); replace it "
+                    "with '%s'",
+                    name,
+                    self.filename,
+                    replacement,
+                )
+
+    def normalize_reporter_lists(self, config: _Config) -> None:
+        """Fill in the default sub-directives of each configuration of a reporter that is configured multiple times,
+        i.e. with a list of configurations instead of a single one (a single one gets its defaults from the deep merge
+        with DEFAULT_CONFIG done in :py:func:`load`, which cannot reach inside a list).
+
+        :param config: The configuration; the reporters configured with a list are replaced in place.
+        :raises ValueError: If an entry of a reporter's list of configurations is not a set of directives.
+        """
+        # Plain-dict views: the values written are lists, which the _ConfigReport TypedDict allows but whose keys are
+        # not statically known here.
+        report = cast('dict[str, Any]', config.get('report', {}))
+        default_report = cast('dict[str, Any]', DEFAULT_CONFIG['report'])
+        for name, cfgs in report.items():
+            if not isinstance(cfgs, list):
+                continue
+            defaults = default_report.get(name, {})
+            normalized = []
+            for i, cfg in enumerate(cfgs):
+                if not isinstance(cfg, dict):
+                    raise ValueError(
+                        f"Reporter '{name}' is configured with a list, but entry {i + 1} of that list is a "
+                        f'{type(cfg).__name__} instead of a set of directives, in the configuration file '
+                        f'{self.filename}.'
+                    )
+                normalized.append(self.dict_deep_merge(cast('_Config', cfg), cast('_Config', defaults)))
+            report[name] = normalized
+            logger.info('Reporter %s is configured %d times', name, len(normalized))
 
     def check_for_unrecognized_keys(self, config: _Config) -> None:
         """Test if config has keys not in DEFAULT_CONFIG (bad keys, e.g. typos); if so, raise ValueError. Also cleanup
@@ -121,17 +223,19 @@ class YamlConfigStorage(BaseYamlFileStorage):
         :param config: The configuration.
         :raises ValueError: If the configuration has keys not in DEFAULT_CONFIG (bad keys, e.g. typos)
         """
-        config_for_extras = copy.deepcopy(config)
+        # Scratch copy of the config, mutated off-schema (None placeholders, hook kinds popped) to diff against
+        # DEFAULT_CONFIG, so typed as a plain dict.
+        config_for_extras = cast('dict[str, Any]', copy.deepcopy(config))
         if 'job_defaults' in config_for_extras:
             # Create missing 'job_defaults' keys from DEFAULT_CONFIG
             for key in DEFAULT_CONFIG['job_defaults']:
                 if 'job_defaults' not in config_for_extras:
                     config_for_extras['job_defaults'] = {}
-                config_for_extras['job_defaults'][key] = None  # ty:ignore[invalid-key]
+                config_for_extras['job_defaults'][key] = None
             for key in DEFAULT_CONFIG['differ_defaults']:
                 if 'differ_defaults' not in config_for_extras:
                     config_for_extras['differ_defaults'] = {}
-                config_for_extras['differ_defaults'][key] = None  # ty:ignore[invalid-key]
+                config_for_extras['differ_defaults'][key] = None
         if 'hooks' in sys.modules:
             # Remove extra keys in config used in hooks (they are not in DEFAULT_CONFIG)
             for _, obj in inspect.getmembers(
@@ -144,8 +248,22 @@ class YamlConfigStorage(BaseYamlFileStorage):
                     ):
                         config_for_extras['job_defaults'].pop(obj.__kind__, None)
                 elif issubclass(obj, ReporterBase) and obj.__kind__ not in DEFAULT_CONFIG['report']:
-                    config_for_extras['report'].pop(obj.__kind__, None)  # ty:ignore[call-non-callable]
-        extras: _Config = self.dict_deep_difference(config_for_extras, DEFAULT_CONFIG, ignore_underline_keys=True)
+                    config_for_extras['report'].pop(obj.__kind__, None)
+        for name in LEGACY_REPORTERS:
+            # Not in DEFAULT_CONFIG (see fill_legacy_reporters), so not diffed against it.
+            config_for_extras.get('report', {}).pop(name, None)
+        for name, reporter_config in config_for_extras.get('report', {}).items():
+            if isinstance(reporter_config, list):
+                # A reporter configured multiple times: collapse its configurations into one so that an unrecognized
+                # directive in any of them is still caught by the diff against DEFAULT_CONFIG below.
+                reporter_config = {k: v for cfg in reporter_config if isinstance(cfg, dict) for k, v in cfg.items()}
+                config_for_extras['report'][name] = reporter_config
+            if isinstance(reporter_config, dict):
+                # 'tags' is accepted by every reporter but, having no default, is not in DEFAULT_CONFIG.
+                reporter_config.pop('tags', None)
+        extras = self.dict_deep_difference(
+            cast('_Config', config_for_extras), DEFAULT_CONFIG, ignore_underline_keys=True
+        )
         if not extras.get('report'):
             extras.pop('report', None)
         if extras:
@@ -164,14 +282,18 @@ class YamlConfigStorage(BaseYamlFileStorage):
             # deepcopy so that later mutations of the loaded config cannot corrupt the shared DEFAULT_CONFIG
             config['job_defaults'] = copy.deepcopy(DEFAULT_CONFIG['job_defaults'])
         else:
-            if 'shell' in config['job_defaults']:
-                if 'command' in config['job_defaults']:
-                    raise KeyError(
-                        "Found both 'shell' and 'command' job_defaults in config, a duplicate. Please remove 'shell' "
-                        'ones.'
-                    )
-                config['job_defaults']['command'] = config['job_defaults'].pop('shell')
-            for key in ('all', 'url', 'browser', 'command'):
+            # The legacy keys are not in the _ConfigJobDefaults TypedDict, so rename them on a plain-dict view
+            job_defaults = cast('dict[str, Any]', config['job_defaults'])
+            for legacy_key, key in LEGACY_JOB_DEFAULTS_KEYS.items():
+                if legacy_key in job_defaults:
+                    if key in job_defaults:
+                        raise KeyError(
+                            f"Found both '{legacy_key}' and '{key}' in job_defaults in config, a duplicate. Please "
+                            f"rename '{legacy_key}' to '{key}', merging the two."
+                        )
+                    logger.info("Using legacy key '%s' in job_defaults in config as '%s'", legacy_key, key)
+                    job_defaults[key] = job_defaults.pop(legacy_key)
+            for key in ('all_jobs', 'url_jobs', 'browser_jobs', 'command_jobs'):
                 if key not in config['job_defaults'] or config['job_defaults'][key] is None:
                     config['job_defaults'][key] = {}
 
@@ -181,16 +303,24 @@ class YamlConfigStorage(BaseYamlFileStorage):
         :param args: None used.
         """
         logger.debug(f'Loading configuration from {self.filename}')
-        config: _Config = self.parse(self.filename)
+        config: _Config | None = self.parse(self.filename)
 
         if config:
             self.replace_none_keys(config)
 
-            # Fix change in key spelling
-            if 'utf-8' in config.get('report', {}).get('email', {}).get('smtp', {}):
-                config['report']['email']['smtp']['utf_8'] = config['report']['email']['smtp'].pop('utf-8')  # ty:ignore[invalid-key]
+            # Fix change in key spelling (the email reporter may be configured more than once)
+            for email_config in reporter_configs(config.get('report', {}), 'email'):
+                smtp_config = cast('dict[str, Any]', email_config.get('smtp', {}))
+                if 'utf-8' in smtp_config:
+                    smtp_config['utf_8'] = smtp_config.pop('utf-8')
+            # The gotify reporter's message title was mistakenly named 'title' instead of 'subject' in DEFAULT_CONFIG
+            for gotify_config in reporter_configs(config.get('report', {}), 'gotify'):
+                if isinstance(gotify_config, dict) and 'title' in gotify_config:
+                    title = gotify_config.pop('title')
+                    gotify_config.setdefault('subject', title)
 
-            config = self.remove_deprecated_keys(config)
+            self.fill_legacy_reporters(config)
+            self.normalize_reporter_lists(config)
             self.check_for_unrecognized_keys(config)
 
             # If config is missing keys in DEFAULT_CONFIG, log the missing keys and deep merge DEFAULT_CONFIG
@@ -214,17 +344,17 @@ class YamlConfigStorage(BaseYamlFileStorage):
             except TypeCheckError as exc:
                 raise ValueError(f'Found invalid data in configuration file {self.filename} entry:\n{exc})') from None
 
-            # format headers
-            for job_defaults_type in ('all', 'url', 'browser'):
+            # format headers and cookies (a null one is kept as removed, so that it stops the less specific defaults
+            # from supplying it)
+            for job_defaults_type in ('all_jobs', 'url_jobs', 'browser_jobs'):
                 if 'headers' in config['job_defaults'][job_defaults_type]:
-                    config['job_defaults'][job_defaults_type]['headers'] = Headers(
-                        {k: str(v) for k, v in config['job_defaults'][job_defaults_type]['headers'].items()},
-                        encoding='utf-8',
+                    config['job_defaults'][job_defaults_type]['headers'] = headers_from_dict(
+                        config['job_defaults'][job_defaults_type]['headers']
                     )
                 if 'cookies' in config['job_defaults'][job_defaults_type]:
-                    config['job_defaults'][job_defaults_type]['cookies'] = {
-                        k: str(v) for k, v in config['job_defaults'][job_defaults_type]['cookies'].items()
-                    }
+                    config['job_defaults'][job_defaults_type]['cookies'] = cookies_from_dict(
+                        config['job_defaults'][job_defaults_type]['cookies']
+                    )
             logger.info(f'Loaded configuration from {self.filename}')
 
         else:
@@ -397,6 +527,18 @@ class YamlJobsStorage(BaseYamlFileStorage, JobsBaseFileStorage):
                     )
                 )
             ) from None
+        except yaml.constructor.ConstructorError as e:
+            location = (
+                f' in line {e.problem_mark.line + 1}, column {e.problem_mark.column + 1}' if e.problem_mark else ''
+            )
+            raise ValueError(
+                '\n   '.join(
+                    (
+                        f'YAML error: {e.problem}{location}',
+                        *job_files_for_error(),
+                    )
+                )
+            ) from None
 
         conflicting_jobs = [guid_jobs[0].get_location() for _, guid_jobs in jobs_by_guid.items() if len(guid_jobs) != 1]
         if conflicting_jobs:
@@ -435,7 +577,7 @@ class YamlJobsStorage(BaseYamlFileStorage, JobsBaseFileStorage):
             fp = io.StringIO('\n---\n'.join(f.read_text(encoding='utf-8-sig') for f in self.filename if f.is_file()))
             return self._parse(fp, self.filename)
 
-    def save(self, jobs: Sized[JobBase]) -> None:
+    def save(self, jobs: Iterable[JobBase]) -> None:
         """Save jobs to the job YAML file.
 
         :param jobs: An iterable of JobBase objects to be written.

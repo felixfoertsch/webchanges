@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -22,6 +23,9 @@ from webchanges.util import mark_to_html
 logger = logging.getLogger(__name__)
 
 bs4_is_installed = importlib.util.find_spec('bs4') is not None
+
+# Deprecated filters exercised by data/filters_testdata.yaml, which emit a DeprecationWarning
+DEPRECATED_FILTERS_IN_TESTDATA = {'grep', 'grepi', 'remove-duplicate-lines'}
 # skip_mac_issue = pytest.mark.skipif(
 #     sys.platform == 'darwin' and sys.version_info == (3, 12),
 #     reason='Crashing',
@@ -92,7 +96,7 @@ def test_filters(test_data: dict[str, Any]) -> None:
         filtercls = FilterBase.__subclasses__.get(filter_kind)
         if filtercls is None:
             raise ValueError(f'Unknown filter kind: {filter_kind}:{subfilter}')
-        deprecation_ctx = pytest.deprecated_call() if filter_kind in {'grep', 'grepi'} else nullcontext()
+        deprecation_ctx = pytest.deprecated_call() if filter_kind in DEPRECATED_FILTERS_IN_TESTDATA else nullcontext()
         with deprecation_ctx:
             # noinspection PyTypeChecker
             filter_result = filtercls(local_job_state).filter(result, '', subfilter)
@@ -228,6 +232,21 @@ def test_deprecated_filters() -> None:
     )
     assert _warning_message(w[0].message)[: len(expected)] == expected
 
+    # urlwatch's lynx method runs the default method instead, ignoring lynx's options
+    with pytest.warns(DeprecationWarning) as w:
+        data, _ = filtercls(job_state).filter(  # ty:ignore[call-non-callable]
+            '<div>a</div>',
+            'text/plain',
+            {'method': 'lynx', 'width': 200},
+        )
+    assert data == 'a'
+    assert len(w) == 1
+    expected = (
+        "Filter html2text's method 'lynx' is no longer supported and the filter's default method is used instead: "
+        'remove method and its options width, which are ignored (Job 0: '
+    )
+    assert _warning_message(w[0].message)[: len(expected)] == expected
+
     filtercls = FilterBase.__subclasses__.get('html2text')
     with pytest.warns(DeprecationWarning) as w:
         data, _ = filtercls(job_state).filter('<div>a</div>', 'text/plain', {'method': 're'})  # ty:ignore[call-non-callable]
@@ -258,25 +277,23 @@ def test_deprecated_filters() -> None:
         data, _ = filtercls(job_state).filter('a  \nb', 'text/plain', {})  # ty:ignore[call-non-callable]
     assert data == 'a\nb'
     assert len(w) == 1
+    expected = "The 'striplines' filter is deprecated; replace with 'strip' and sub-directive 'splitlines: true' (Job "
+    assert _warning_message(w[0].message)[: len(expected)] == expected
+
+    filtercls = FilterBase.__subclasses__.get('remove-duplicate-lines')
+    with pytest.warns(DeprecationWarning) as w:
+        data, _ = filtercls(job_state).filter('a\nb\na', 'text/plain', {})  # ty:ignore[call-non-callable]
+    assert data == 'a\nb'
+    assert len(w) == 1
     expected = (
-        "The 'strip_each_line' filter is deprecated; replace with 'strip' and sub-directive 'splitlines: true' (Job "
+        "The 'remove-duplicate-lines' filter is deprecated; replace with 'remove_repeated' and sub-directive "
+        "'adjacent: false' (Job "
     )
     assert _warning_message(w[0].message)[: len(expected)] == expected
 
 
 # Cases of (filter_kind, data, mime_type, subfilter, exc_type, expected message prefix) that must raise.
 FILTER_EXCEPTION_CASES: list[tuple[str, str, str, dict[str, Any], type[Exception], str]] = [
-    (
-        'html2text',
-        '<div>a</div>',
-        'text/plain',
-        {'method': 'lynx'},
-        NotImplementedError,
-        (
-            "Filter html2text's method 'lynx' is no longer supported; for similar results, use the filter without "
-            'specifying a method. (Job 0:'
-        ),
-    ),
     (
         'html2text',
         '<div>a</div>',
@@ -429,6 +446,28 @@ def test_filter_exceptions_jq(data: str, subfilter: dict[str, Any], expected: st
         # noinspection PyTypeChecker
         filtercls(job_state).filter(data, 'text/json', subfilter)  # ty:ignore[call-non-callable]
     assert e.value.args[0][: len(expected)] == expected
+
+
+def test_html2text_decodes_json_encoded_string() -> None:
+    """A JSON document that is a bare string is decoded (unescaping the \\uXXXX) before being converted."""
+    json_encoded = json.dumps('<div>café — café</div>')  # i.e. '"<div>caf\\u00e9 \\u2014 caf\\u00e9</div>"'
+    assert 'é' not in json_encoded  # ensure_ascii is on by default, so the input really is escaped
+    data, mime_type = Html2TextFilter(job_state).filter(json_encoded, 'application/json', {})
+    assert data == 'café — café'
+    assert mime_type == 'text/markdown'
+
+
+def test_html2text_leaves_json_objects_alone() -> None:
+    """A JSON document that is not a bare string is passed through as is."""
+    json_encoded = json.dumps({'a': 'café'})
+    data, _ = Html2TextFilter(job_state).filter(json_encoded, 'application/json', {'method': 'strip_tags'})
+    assert data == json_encoded
+
+
+def test_html2text_ignores_invalid_json() -> None:
+    """Data claiming to be JSON but that doesn't parse is passed through as is."""
+    data, _ = Html2TextFilter(job_state).filter('<div>a</div>', 'application/json', {})
+    assert data == 'a'
 
 
 def test_html2text_roundtrip() -> None:

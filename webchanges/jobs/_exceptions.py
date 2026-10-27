@@ -4,8 +4,14 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = ['http.client']
+
 from http.client import responses as http_response_names
 from typing import Any
+
+# The synthetic HTTP response status code carried by the TransientHTTPError raised for an empty response when the
+# empty_as_error job directive is set (there is no real status code, as the server responded normally).
+EMPTY_RESPONSE_STATUS_CODE = 999
 
 
 class NotModifiedError(Exception):
@@ -22,13 +28,20 @@ class TransientHTTPError(Exception):
     - 502 Bad Gateway
     - 503 Service Unavailable
     - 504 Gateway Timeout
+
+    Also raised, for any job kind, with the synthetic EMPTY_RESPONSE_STATUS_CODE when the job returns no data and its
+    empty_as_error directive is set.
+
+    ``retry_after`` is the number of seconds the server asked to wait before retrying (its Retry-After header), if any.
     """
 
     status_code: int
+    retry_after: float | None
 
-    def __init__(self, *args: object, status_code: int) -> None:
+    def __init__(self, *args: object, status_code: int, retry_after: float | None = None) -> None:
         super().__init__(*args)
         self.status_code = status_code
+        self.retry_after = retry_after
 
 
 class TransientBrowserError(Exception):

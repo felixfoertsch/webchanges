@@ -15,6 +15,8 @@ Having it into a standalone module allows running the program without requiring 
 
 from __future__ import annotations
 
+__lazy_modules__ = ['pathlib']
+
 from pathlib import Path
 from typing import Any
 
@@ -163,7 +165,7 @@ class SsdbMiniDBStorage(SsdbStorage):
 
         return total_moved
 
-    def rollback(self, timestamp: float) -> None:
+    def rollback(self, timestamp: float, count: bool = False) -> None:
         raise NotImplementedError("Rolling back of legacy 'minidb' databases is not supported")
 
     def flushdb(self) -> None:

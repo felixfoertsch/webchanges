@@ -20,7 +20,9 @@ The configuration file ``config.yaml`` contains the directives toggling the repo
 or off, and their sub-directives (settings). This file is editable using any text editor or with the command
 ``webchanges --edit--config``. Reporters are listed  under the ``report`` section.
 
-Each reporter has a directive called ``enabled`` that can be set to true or false.
+Each reporter has a directive called ``enabled`` that can be set to true or false, and an optional one called
+``tags`` restricting it to certain jobs (see :ref:`here <reporter_tags>`). A reporter can also be configured more than
+once, e.g. to send different jobs to different destinations (see :ref:`here <multiple_reporters>`).
 
 .. note::
    The ``config.yaml`` file is located in Linux or macOS in the ``~/.config/webchanges`` directory, in Windows in
@@ -93,6 +95,65 @@ Reporters are based on :ref:`reports <reports>`, as follows, and inherit that re
    Even though the ``email`` reporter is listed under ``text`` for historical reason, it also inherits from the
    ``html`` report when its ``html`` option is set to ``true`` (default).
 
+
+
+.. _reporter_tags:
+
+Reporting only certain jobs (``tags``)
+--------------------------------------
+Any reporter accepts an optional ``tags`` directive: one tag, or a list of tags, restricting the reporter to the jobs
+having any of those tags in their :ref:`tags <tags>` job directive. A reporter with no ``tags`` directive reports on
+every job, as before.
+
+.. code-block:: yaml
+
+   report:
+     stdout:
+       enabled: true
+       tags: personal  # a single tag needs no list
+
+.. note::
+   The command line arguments that force a single reporter — ``--test-reporter`` and ``--errors`` — ignore ``tags``,
+   since the jobs they report on are either synthetic or explicitly chosen by you.
+
+.. versionadded:: 3.38
+
+
+.. _multiple_reporters:
+
+Configuring the same reporter more than once
+--------------------------------------------
+A reporter can be configured multiple times by replacing its single set of directives with a **list** of them. Each
+entry is a complete, independent configuration of that reporter, and combining this with ``tags`` allows different
+jobs to be reported to different destinations (e.g. different email addresses or different Telegram chats):
+
+.. code-block:: yaml
+
+   report:
+     telegram:
+       - enabled: true
+         bot_token: '123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh'
+         chat_id: '11111111'
+         tags: personal
+       - enabled: true
+         bot_token: '123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh'
+         chat_id: '22222222'
+         tags:
+           - team
+           - ops
+
+Directives you don't specify in an entry take their default value, exactly as they do for a single configuration, and
+an entry whose ``enabled`` is false is skipped. Reports produced by a reporter restricted by ``tags`` note in their
+footer how many of the jobs run they cover.
+
+A job that ends up being reported by no reporter at all — typically a typo in a tag — is called out in a warning
+during the run.
+
+.. tip::
+   The ``--smtp-login``, ``--telegram-chats`` and ``--xmpp-login`` command line arguments check the credentials of
+   the **first** configuration of the respective reporter only.
+
+.. versionadded:: 3.38
 
 
 .. _tz:
@@ -190,6 +251,9 @@ Sub-directives
 * ``from``: The sender's email address. **Do not use your main email address** but create a throwaway one!
 * ``to``: The destination email address(es); if sending to more than one recipient, concatenate the addresses with a
   comma (``,``).
+* ``reply_to``: The address(es) that email clients reply to, set in the ``Reply-To`` header; to set more than one,
+  concatenate the addresses with a comma (``,``). Default: blank (no ``Reply-To`` header, so replies go to ``from``).
+  Added in version 3.39.
 * ``subject``: The subject line. Use ``{count}`` for the number of reports, ``{jobs}`` for the title of jobs
   reported, and ``{jobs_files}`` for a space followed by the name of the jobs file(s) used within parenthesis, stripped
   of preceding ``jobs-``, if not using the default ``jobs.yaml``. Default: ``[webchanges] {count}
@@ -255,6 +319,12 @@ SMTP sub-directives
 * ``insecure_password``: The password used to authenticate (if keyring is not used).
 * ``utf_8``: Whether to use RFC 6531 Internationalized Email, aka SMTPUTF8 service extension (true/false). Default is
   true.
+
+:program:`webchanges` gives up on the SMTP server if it does not accept the connection, or does not answer a command,
+within 60 seconds, ending with a timeout error instead of waiting indefinitely.
+
+.. versionchanged:: 3.38
+   Added the 60-second timeout; previously an unresponsive SMTP server blocked the run indefinitely.
 
 Amazon Simple Email Service (SES) example
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -434,9 +504,21 @@ Here is a sample configuration:
      enabled: true
      priority: 4
      server_url: http://127.0.0.1:8090
-     subject: [webchanges] {count} changes{jobs_files}: {jobs}
+     subject: '[webchanges] {count} changes{jobs_files}: {jobs}'
      token: Aa1yyikLFjEm35A
 
+Sub-directives:
+
+* ``priority``: The message priority (an integer); defaults to 0.
+* ``server_url``: The URL of the gotify server (required).
+* ``subject``: The title of the message; can contain the placeholders ``{count}`` (the number of jobs reported),
+  ``{jobs}`` (their names) and ``{jobs_files}`` (the names of the jobs files, if not the default one). Defaults to no
+  title.
+* ``token``: The application token (required).
+
+.. versionchanged:: 3.38
+   The ``subject`` sub-directive is now recognized; the sub-directive ``title``, which was listed in the default
+   configuration but had no effect, is deprecated and treated as ``subject``.
 
 
 .. _ifttt:
@@ -733,7 +815,7 @@ All environment variables are preserved and the following ones added:
 +====================================+==================================================================+
 | ``WEBCHANGES_REPORT_CONFIG_JSON``  | All report parameters in JSON format                             |
 +------------------------------------+------------------------------------------------------------------+
-| ``WEBCHANGES_CHANGED_JOBS_JSON``   | All parameters of changed jobs in JSON format                    |
+| ``WEBCHANGES_CHANGED_JOBS_JSON``   | The directives of the jobs reported on, as a list in JSON format |
 +------------------------------------+------------------------------------------------------------------+
 
 If the command generates an error, the output of the error will be reported in the first line(s).
@@ -741,6 +823,8 @@ If the command generates an error, the output of the error will be reported in t
 .. versionadded:: 3.8
 .. versionchanged:: 3.9
    Added environment variable ``WEBCHANGES_CHANGED_JOBS_JSON``
+.. versionchanged:: 3.39
+   Fixed: ``WEBCHANGES_CHANGED_JOBS_JSON`` was not set.
 
 
 

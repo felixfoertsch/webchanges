@@ -46,10 +46,10 @@ At the moment, the following filters are available:
 
   - :ref:`css <css>`: Filter XML/HTML using CSS selectors.
   - :ref:`xpath <xpath>`: Filter XML/HTML using XPath expressions.
-  - :ref:`element-by-class <element-by-…>`: Get all HTML elements matching a class.
-  - :ref:`element-by-id <element-by-…>`: Get all HTML elements matching an id.
-  - :ref:`element-by-style <element-by-…>`: Get all HTML elements matching a style.
-  - :ref:`element-by-tag <element-by-…>`: Get all HTML elements matching a tag.
+  - :ref:`element-by-class`: Get all HTML elements matching a class.
+  - :ref:`element-by-id`: Get all HTML elements matching an id.
+  - :ref:`element-by-style`: Get all HTML elements matching a style.
+  - :ref:`element-by-tag`: Get all HTML elements matching a tag.
 
 * To extract text from HTML (or XML):
 
@@ -93,6 +93,8 @@ At the moment, the following filters are available:
 
   - :ref:`format-xml`: Reformat (pretty-print) XML (using lxml.etree).
   - :ref:`pretty-xml`: Reformat (pretty-print) XML (using Python's xml.minidom).
+  - :ref:`xmltoyaml`: Convert XML to YAML.
+  - :ref:`xmltojson`: Convert XML to JSON.
 
 * To make iCal more readable:
 
@@ -105,6 +107,7 @@ At the moment, the following filters are available:
 * To just detect if anything changed:
 
   - :ref:`sha1sum`: Calculate the SHA-1 checksum of the data.
+  - :ref:`sha256sum`: Calculate the SHA-256 checksum of the data.
 
 * To filter and/or edit text:
 
@@ -135,7 +138,7 @@ Advanced Python programmers can write their own custom filters; see :ref:`hooks`
 
 ``absolute_links``
 ------------------
-Convert relative URLs of all ``action``, ``href` and ``src`` attribute in any HTML tag, as well the ``data``
+Convert relative URLs of all ``action``, ``href`` and ``src`` attribute in any HTML tag, as well the ``data``
 attribute of the ``<object>`` tag, to absolute ones.
 
 .. note:: This filter is not needed (and could interfere) if you already are using the :ref:`beautify` filter (which has
@@ -341,6 +344,16 @@ will not have any ``<a>`` tag in its results:
          selector: 'body'
          exclude: 'a'
 
+When ``exclude`` is specified, ``selector`` can be omitted, in which case the whole document minus the excluded elements
+is returned. For example, the following job returns the entire page without any ``<script>`` or ``<style>`` element:
+
+.. code-block:: yaml
+
+   url: https://example.org/css-exclude-only.html
+   filters:
+     - css:
+         exclude: script, style
+
 Limiting the returned items from a CSS selector
 ```````````````````````````````````````````````
 If you only want to return a subset of the items returned by a CSS selector, you can use two additional sub-directives:
@@ -389,7 +402,7 @@ Alternatively, you can chain the :ref:`sort <sort>` filter.
 
 Optional directives
 ```````````````````
-* ``selector`` (default): the CSS selector.
+* ``selector`` (default): the CSS selector (default: the whole document, but only if ``exclude`` is specified).
 * ``method``: Either of ``html`` (default) or ``xml``.
 * ``namespaces``: Mapping of XML namespaces for matching (default: None).
 * ``exclude``: css selector for elements to remove from the final result (default: None).
@@ -488,6 +501,10 @@ Optional sub-directives
 
 
 
+.. _element-by-class:
+.. _element-by-id:
+.. _element-by-style:
+.. _element-by-tag:
 .. _element-by-…:
 
 ``element-by-`` [ ``class`` | ``id`` | ``style`` | ``tag`` ]
@@ -540,6 +557,18 @@ To extract ``<div style="something">.../<div>`` from a page:
    url: https://example.org/styletest.html
    filters:
      - element-by-style: something
+
+Sub-directives
+``````````````
+Each filter takes one sub-directive, which can also be specified inline as the value of the filter, as in the examples
+above:
+
+* ``class`` (``element-by-class``): The value of the ``class`` attribute to match exactly (required).
+* ``id`` (``element-by-id``): The value of the ``id`` attribute to match exactly (required).
+* ``style`` (``element-by-style``): The value of the ``style`` attribute to match exactly (required).
+* ``tag`` (``element-by-tag``): The name of the tag to match (required).
+
+For more complex selections, use the :ref:`css` or :ref:`xpath` filters.
 
 
 
@@ -619,9 +648,13 @@ Optional sub-directives
 * ``indentation`` (integer or string): Either the number of spaces or a string to be used to indent each level with; if
   ``0``, a negative number or ``""`` then no indentation (default: 4, i.e. 4 spaces).
 * ``sort_keys`` (true/false): Whether to sort the output of dictionaries by key (default: false).
+* ``compact`` (true/false): Whether to remove all unnecessary whitespace, overriding ``indentation`` (default: false).
 
 .. versionadded:: 3.0.1
    ``sort_keys`` sub-directive.
+
+.. versionadded:: 3.38
+   ``compact`` sub-directive.
 
 .. versionchanged:: 3.20
    The filter sets the job's ``monospace`` directive to ``true``.
@@ -666,6 +699,10 @@ This filter displays the contents both in binary and ASCII using the hex dump fo
 ``html2text``
 -------------
 This filter converts HTML (or XML) to Unicode text.
+
+If the data reaching the filter has a JSON media type and consists entirely of a JSON string (i.e. the HTML is
+returned inside a JSON-encoded string), it is JSON-decoded first, so that its Unicode escape sequences are converted
+into the characters they represent. JSON objects and arrays are passed through unchanged.
 
 Optional sub-directives
 ```````````````````````
@@ -803,8 +840,15 @@ packages <optional_packages>` as follows:
 .. versionchanged:: 3.0
    Method ``re`` renamed to ``strip_tags``.
 
+.. versionchanged:: 3.38
+   Data of a JSON media type consisting entirely of a JSON string is JSON-decoded before conversion.
+
 .. deprecated:: urlwatch
    Removed method ``lynx`` (external OS-specific dependency).
+
+.. versionchanged:: 3.39
+   Method ``lynx`` runs the default method instead (ignoring its options) and prints a deprecation warning, instead
+   of failing.
 
 
 
@@ -837,12 +881,14 @@ follows:
 ``jq``
 ------
 
-Linux/macOS ASCII only
-``````````````````````
+ASCII only
+``````````
 
 The ``jq`` filter uses the Python bindings for `jq <https://stedolan.github.io/jq/>`__, a lightweight ASCII JSON
-processor. It is currently available only for Linux (most flavors) and macOS (no Windows) and does not handle Unicode;
-see :ref:`below <filtering_json>` for a cross-platform and Unicode-friendly way of selecting JSON.
+processor. It does not handle Unicode; see :ref:`below <filtering_json>` for a Unicode-friendly way of selecting JSON.
+
+.. versionchanged:: 3.38
+   Available on Windows (previously Linux and macOS only).
 
 Please also note that command line arguments of the standalone ``jq`` program are NOT supported by this library.
 
@@ -857,6 +903,11 @@ Supports aggregations, selections, and the built-in operators like ``length``.
 For more information on the operations permitted, see the `jq Manual
 <https://stedolan.github.io/jq/manual/#Basicfilters>`__.
 
+Sub-directives
+``````````````
+* ``query`` (default): The jq filter expression to apply (required); it can also be specified inline as the value of
+  ``jq``, as in the example above.
+
 Required packages
 :::::::::::::::::
 To run jobs with this filter, you need to first install :ref:`additional Python packages <optional_packages>` as
@@ -868,8 +919,8 @@ follows:
 
 .. _filtering_json:
 
-Filtering JSON on Windows or containing Unicode and without ``jq``
-``````````````````````````````````````````````````````````````````
+Filtering JSON containing Unicode without ``jq``
+````````````````````````````````````````````````
 Python programmers on all OSs can use an advanced technique to select only certain elements of the JSON object; see
 :ref:`json_dict`. This method will preserve Unicode characters.
 
@@ -1078,6 +1129,11 @@ This filter deserializes an XML object and pretty-prints it. It uses Python's xm
    filters:
      - pretty-xml:
 
+Optional sub-directives
+```````````````````````
+* ``indentation`` (default): The number of spaces of each level of indentation (default: 2); it can also be specified
+  inline as the value of ``pretty-xml``.
+
 .. versionadded:: 3.3
 
 
@@ -1237,7 +1293,6 @@ To extract the first line:
 .. code-block:: yaml
 
    url: https://example.com/regex-firstline.html
-   command: python -c "[print(f'line {n}') for n in range(1, 3)]"
    filters:
      - re.findall: '^.*'
 
@@ -1250,7 +1305,6 @@ plus additional text (``(?!\n.+)``):
 .. code-block:: yaml
 
    url: https://example.com/regex-lastline.html
-   command: python -c "[print(f'line {n}') for n in range(3)]"
    filters:
      - re.findall: '(?m)(^.*$)(?!\n.+)'
 
@@ -1389,6 +1443,10 @@ Optional sub-directives
 .. versionchanged:: 3.13
    Added ``adjacent`` sub-directive.
 
+.. versionchanged:: 3.38
+   The ``remove-duplicate-lines`` filter, inherited from :program:`urlwatch`, is deprecated: replace it with
+   ``remove_repeated`` with ``adjacent: false``, which does the same.
+
 
 
 .. _reverse:
@@ -1444,6 +1502,22 @@ any detail and avoiding saving large snapshots of data.
    url: https://example.com/sha.html
    filters:
      - sha1sum:
+
+
+
+.. _sha256sum:
+
+``sha256sum``
+-------------
+This filter calculates a SHA-256 hash for the contents, like :ref:`sha1sum` but with a longer hash that is even less
+likely to be the same for different contents.
+
+.. code-block:: yaml
+
+   name: "Calculate SHA-256 hash"
+   url: https://example.com/sha256.html
+   filters:
+     - sha256sum:
 
 
 
@@ -1598,6 +1672,82 @@ Optional sub-directives
 
 
 
+.. _xmltojson:
+
+``xmltojson``
+-------------
+This filter converts XML data to JSON using the `xmltodict <https://github.com/martinblech/xmltodict>`__ Python
+package, and serializes it to a pretty-printed indented string with a default indent level of 4. Each element becomes a
+key; an element's attributes become keys prefixed with ``@`` and, if it also has attributes or child elements, its text
+becomes the key ``#text``; repeated elements become a list. Values are strings, or null for empty elements.
+
+.. tip:: For a more compact and legible output, use :ref:`xmltoyaml` instead.
+
+.. code-block:: yaml
+
+   name: "convert XML to JSON"
+   url: https://example.com/xmltojson.xml
+   filters:
+     - xmltojson:
+
+If the job directive ``monospace`` is unset, to improve the readability in HTML reports this filter will set it to
+``true``. To override, add the directive ``monospace: true`` to the job (see :ref:`here <monospace>`).
+
+Optional sub-directives
+```````````````````````
+* ``indentation`` (integer): The number of spaces to indent each level with; if ``0`` or a negative number, then no
+  indentation (default: 4).
+* ``sort_keys`` (true/false): Whether to sort the output of dictionaries by key (default: false).
+* ``compact`` (true/false): Whether to remove all unnecessary whitespace, overriding ``indentation`` (default: false).
+
+Required packages
+`````````````````
+To run jobs with this filter, you need to first install :ref:`additional Python packages <optional_packages>` as
+follows:
+
+.. code-block:: bash
+
+   uv pip install --upgrade webchanges[xmltodict]
+
+.. versionadded:: 3.38
+
+
+
+.. _xmltoyaml:
+
+``xmltoyaml``
+-------------
+This filter converts XML data to YAML using the `xmltodict <https://github.com/martinblech/xmltodict>`__ Python
+package (with the same structure as :ref:`xmltojson`) and Python's `PyYAML <https://pyyaml.org/>`__ library, with a
+default indent level of 2.
+
+.. code-block:: yaml
+
+   name: "convert XML to YAML"
+   url: https://example.com/xmltoyaml.xml
+   filters:
+     - xmltoyaml:
+
+If the job directive ``monospace`` is unset, to improve the readability in HTML reports this filter will set it to
+``true``. To override, add the directive ``monospace: true`` to the job (see :ref:`here <monospace>`).
+
+Optional sub-directives
+```````````````````````
+* ``indentation`` (integer): The number of spaces to indent each level with (default: 2).
+
+Required packages
+`````````````````
+To run jobs with this filter, you need to first install :ref:`additional Python packages <optional_packages>` as
+follows:
+
+.. code-block:: bash
+
+   uv pip install --upgrade webchanges[xmltodict]
+
+.. versionadded:: 3.38
+
+
+
 .. _xpath:
 
 ``xpath``
@@ -1668,6 +1818,16 @@ will not have any ``<a>`` tag in its results:
          path: //body
          exclude: //a
 
+When ``exclude`` is specified, ``path`` can be omitted, in which case the whole document minus the excluded elements is
+returned. For example, the following job returns the entire page without any ``<script>`` or ``<style>`` element:
+
+.. code-block:: yaml
+
+   url: https://example.org/xpath-exclude-only.html
+   filters:
+     - xpath:
+         exclude: //script | //style
+
 Limiting the returned items from an XPath expression
 `````````````````````````````````````````````````````
 If you only want to return a subset of the items returned by an XPath expression, you can use two additional
@@ -1717,7 +1877,7 @@ Alternatively, you can chain the :ref:`sort <sort>` filter.
 
 Optional directives
 ```````````````````
-* ``path`` (default): the XPath expression.
+* ``path`` (default): the XPath expression (default: the whole document, but only if ``exclude`` is specified).
 * ``method``: Either of ``html`` (default) or ``xml``.
 * ``namespaces``: Mapping of XML namespaces for matching (default: None).
 * ``exclude``: XPath expression for elements to remove from the final result (default: None).

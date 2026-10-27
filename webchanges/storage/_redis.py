@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = ['msgpack']
+
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -11,11 +13,10 @@ import msgpack
 
 from webchanges.handler import Snapshot
 from webchanges.storage._ssdb import SsdbStorage
+from webchanges.util import missing_dependency
 
-try:
-    import redis
-except ImportError as e:  # pragma: no cover
-    redis = str(e)  # ty:ignore[invalid-assignment]
+# The optional dependency redis is imported only when this database engine is used (see missing_dependency() in
+# webchanges/util.py).
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -29,8 +30,10 @@ class SsdbRedisStorage(SsdbStorage):
     def __init__(self, filename: str | Path) -> None:
         super().__init__(filename)
 
-        if isinstance(redis, str):
-            raise ImportError(f"Python package 'redis' cannot be imported.\n{redis}")
+        try:
+            import redis
+        except ImportError as e:  # pragma: no cover
+            raise missing_dependency(e, 'redis', used_by="the 'redis' database engine", extra='redis') from e
 
         self.db = redis.from_url(str(filename))
         logger.info(f'Using {self.filename} for database')
@@ -157,7 +160,7 @@ class SsdbRedisStorage(SsdbStorage):
         self.db.rename(key, new_key)
         return self.db.llen(new_key)
 
-    def rollback(self, timestamp: float) -> None:
+    def rollback(self, timestamp: float, count: bool = False) -> None:
         """Rolls back the database to timestamp.
 
         :raises: NotImplementedError: This function is not implemented for 'redis' database engine.

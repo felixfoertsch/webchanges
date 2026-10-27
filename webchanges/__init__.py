@@ -12,7 +12,7 @@ supported services. Can check the output of local commands as well.
 
 from __future__ import annotations
 
-__min_python_version__ = (3, 11)  # minimum version of Python required to run; 3.11 supported until fall 2026
+__min_python_version__ = (3, 12)  # minimum version of Python required to run; 3.12 supported until 7 October 2027
 
 
 __project_name__ = str(__package__)
@@ -22,7 +22,7 @@ __project_name__ = str(__package__)
 # * MINOR version when you add functionality in a backwards compatible manner, and
 # * MICRO or PATCH version when you make backwards compatible bug fixes. We no longer use '0'
 # If unsure on increments, use pkg_resources.parse_version to parse
-__version__ = '3.37.0'
+__version__ = '3.39.0'
 __description__ = (
     'Check web (or command output) for changes since last run and notify.\n\nAnonymously alerts you of web changes.'
 )

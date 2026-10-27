@@ -11,21 +11,26 @@ from __future__ import annotations
 import atexit
 import copy
 import importlib.util
+import logging
 import os
 import shutil
 import sys
 import tempfile
 import time
+import warnings
 from abc import ABC
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import yaml
 
 from tests.conftest import prepare_storage_test
 from webchanges import __docs_url__
-from webchanges.handler import Snapshot
+from webchanges.handler import JobState, Snapshot
+from webchanges.jobs import BrowserJob, JobBase, UrlJob
 from webchanges.storage import (
     DEFAULT_CONFIG,
     BaseTextualFileStorage,
@@ -123,7 +128,7 @@ def test_empty_config_file() -> None:
     """Test if config is empyty and DEFAULT_CONFIG is used."""
     config_storage = YamlConfigStorage('')
     config_storage.load()
-    assert config_storage.config['report']
+    assert config_storage.config['report'] == DEFAULT_CONFIG['report']
 
 
 def test_config_is_not_default_config_object() -> None:
@@ -145,6 +150,62 @@ def test_jobs_parse() -> None:
     assert jobs[0].command == 'perl -MTime::HiRes -e \'printf "%f\n",Time::HiRes::time()\''
 
 
+def test_yaml_env_tag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test the !env tag substituting ${VAR} references (also multiple ones in the same scalar) in a jobs file."""
+    monkeypatch.setenv('WEBCHANGES_TEST_SERIES', '570')
+    jobs_file = tmp_path.joinpath('jobs-env.yaml')
+    jobs_file.write_text(
+        "name: !env 'NVIDIA ${WEBCHANGES_TEST_SERIES} series (${WEBCHANGES_TEST_SERIES})'\n"
+        "url: !env 'https://www.example.com/${WEBCHANGES_TEST_SERIES}/#1'\n"
+    )
+    jobs = YamlJobsStorage([jobs_file]).parse(jobs_file)
+    assert len(jobs) == 1
+    assert jobs[0].name == 'NVIDIA 570 series (570)'
+    assert jobs[0].url == 'https://www.example.com/570/#1'
+
+
+def test_yaml_env_tag_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test the !env tag's ${VAR:-default} fallback, and that a set variable takes priority over its default."""
+    monkeypatch.delenv('WEBCHANGES_TEST_UNSET', raising=False)
+    monkeypatch.setenv('WEBCHANGES_TEST_SET', 'from-env')
+    jobs_file = tmp_path.joinpath('jobs-env-default.yaml')
+    jobs_file.write_text(
+        "name: !env '${WEBCHANGES_TEST_UNSET:-fallback} and ${WEBCHANGES_TEST_SET:-unused}'\n"
+        'url: https://www.example.com/\n'
+    )
+    jobs = YamlJobsStorage([jobs_file]).parse(jobs_file)
+    assert jobs[0].name == 'fallback and from-env'
+
+
+def test_yaml_env_tag_no_reference(tmp_path: Path) -> None:
+    """Test that a !env scalar containing no ${VAR} reference is returned unchanged."""
+    jobs_file = tmp_path.joinpath('jobs-env-noref.yaml')
+    jobs_file.write_text("name: !env 'no reference here'\nurl: https://www.example.com/\n")
+    jobs = YamlJobsStorage([jobs_file]).parse(jobs_file)
+    assert jobs[0].name == 'no reference here'
+
+
+def test_yaml_env_tag_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that a !env reference to an unset variable without a default raises a ValueError naming it."""
+    monkeypatch.delenv('WEBCHANGES_TEST_UNSET', raising=False)
+    jobs_file = tmp_path.joinpath('jobs-env-unset.yaml')
+    jobs_file.write_text("url: !env 'https://www.example.com/${WEBCHANGES_TEST_UNSET}/'\n")
+    with pytest.raises(ValueError) as pytest_wrapped_e:
+        YamlJobsStorage([jobs_file]).parse(jobs_file)
+    message = str(pytest_wrapped_e.value)
+    assert "environment variable 'WEBCHANGES_TEST_UNSET' is not set and no default is given" in message
+    assert 'in line 1' in message
+
+
+def test_yaml_env_tag_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test the !env tag in a configuration file (e.g. to keep secrets out of it)."""
+    monkeypatch.setenv('WEBCHANGES_TEST_TOKEN', 'secret-token')
+    cfg = tmp_path.joinpath('config-env.yaml')
+    cfg.write_text("report:\n  telegram:\n    bot_token: !env '${WEBCHANGES_TEST_TOKEN}'\n")
+    config = YamlConfigStorage(cfg).parse(cfg)
+    assert config['report']['telegram']['bot_token'] == 'secret-token'  # noqa: S105 possible hardcoded password
+
+
 def test_check_for_shell_job() -> None:
     """Test if a job is a shell job."""
     jobs_file = data_path.joinpath('jobs-is_shell_job.yaml')
@@ -158,15 +219,32 @@ def test_check_for_shell_job() -> None:
     #     assert len(jobs) == 1
 
 
-def test_legacy_slack_keys() -> None:
-    """Test if legacy report 'slack' keys don't trigger a ValueError even if not in DEFAULT_CONFIG."""
-    config_storage = YamlConfigStorage(config_file)
-    config = config_storage.parse(config_file)
-    config['report']['slack'] = {'enabled': False}
-    # mirror the load() flow: deprecated keys are removed before checking for unrecognized ones
-    config = config_storage.remove_deprecated_keys(config)
-    config_storage.check_for_unrecognized_keys(config)
-    assert 'slack' not in config['report']
+@pytest.mark.parametrize(
+    ('name', 'legacy_config', 'expected'),
+    [
+        ('slack', {'enabled': True, 'webhook_url': 'https://example.com/hook'}, {'markdown': False}),
+        ('mattermost', {'enabled': True, 'webhook_url': 'https://example.com/hook'}, {'markdown': True}),
+        ('shell', {'enabled': True, 'command': ['cat']}, {'ignore_stdout': True, 'ignore_stderr': False}),
+    ],
+)
+def test_legacy_urlwatch_reporters(
+    name: str,
+    legacy_config: dict[str, Any],
+    expected: dict[str, Any],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The urlwatch reporters webchanges replaced are kept and filled with their defaults (until 3.39 'slack' was
+    dropped and the others flagged as unrecognized), with a deprecation warning but no 'unrecognized' one."""
+    config_path = _write_config(tmp_path, {'report': {name: legacy_config}})
+    config_storage = YamlConfigStorage(config_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)  # 'Found unrecognized directive(s)' is a RuntimeWarning
+        with caplog.at_level(logging.WARNING, logger='webchanges.storage._yaml'):
+            config_storage.load()
+    reporter_config = cast('dict[str, Any]', config_storage.config['report'])[name]
+    assert reporter_config == {**YamlConfigStorage.legacy_reporter_defaults(name), **legacy_config, **expected}
+    assert f"Reporter '{name}' of the configuration file" in caplog.text
 
 
 def _write_config(tmp_path: Path, overrides: dict) -> Path:
@@ -237,16 +315,143 @@ def test_remove_remark_keys_strips_underscore_keys() -> None:
 
 def test_load_remark_keys_do_not_break_type_check(tmp_path: Path) -> None:
     """User-added '_'-prefixed remark keys must not trigger a type-check failure."""
-    cfg = _write_config(tmp_path, {'job_defaults': {'all': {'_note': 'a remark'}}})
+    cfg = _write_config(tmp_path, {'job_defaults': {'all_jobs': {'_note': 'a remark'}}})
     YamlConfigStorage(cfg).load()
 
 
-def test_remove_deprecated_keys_strips_slack() -> None:
-    """remove_deprecated_keys drops the legacy 'slack' reporter key."""
-    config = YamlConfigStorage(config_file).parse(config_file)
-    config['report']['slack'] = {'enabled': False}
-    cleaned = YamlConfigStorage.remove_deprecated_keys(config)
-    assert 'slack' not in cleaned['report']
+def _write_config_job_defaults(tmp_path: Path, job_defaults: dict) -> Path:
+    """Write the test config.yaml baseline to tmp_path/config.yaml with its job_defaults replaced by job_defaults."""
+    base = YamlConfigStorage(config_file).parse(config_file)
+    base['job_defaults'] = job_defaults
+    out = tmp_path / 'config.yaml'
+    out.write_text(yaml.safe_dump(base), encoding='utf-8')
+    return out
+
+
+def test_load_legacy_job_defaults_keys(tmp_path: Path) -> None:
+    """The legacy (urlwatch) job_defaults keys are renamed to the job-kind ones, without warnings."""
+    cfg = _write_config_job_defaults(
+        tmp_path,
+        {
+            'all': {'timeout': 10},
+            'url': {'headers': {'User-Agent': 'url'}},
+            'browser': {'headers': {'User-Agent': 'browser'}},
+            'shell': {'max_tries': 2},
+        },
+    )
+    config_storage = YamlConfigStorage(cfg)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        config_storage.load()
+    job_defaults = config_storage.config['job_defaults']
+    assert set(job_defaults) - {'_note'} == {'all_jobs', 'url_jobs', 'browser_jobs', 'command_jobs'}
+    assert job_defaults['all_jobs']['timeout'] == 10
+    assert job_defaults['url_jobs']['headers']['User-Agent'] == 'url'
+    assert job_defaults['browser_jobs']['headers']['User-Agent'] == 'browser'
+    assert job_defaults['command_jobs']['max_tries'] == 2
+    job = JobBase.unserialize({'url': 'https://www.example.com'}).with_defaults(config_storage.config)
+    assert job.headers['User-Agent'] == 'url'
+    assert job.timeout == 10
+
+
+def test_load_job_defaults_null_header_removes_all_jobs_one(tmp_path: Path) -> None:
+    """A header set to null in url_jobs stops the all_jobs one from being sent by url jobs, but not by browser jobs."""
+    cfg = _write_config_job_defaults(
+        tmp_path,
+        {'all_jobs': {'headers': {'DNT': 1, 'Accept-Language': 'en-US'}}, 'url_jobs': {'headers': {'DNT': None}}},
+    )
+    config_storage = YamlConfigStorage(cfg)
+    config_storage.load()
+    job_state = cast('JobState', SimpleNamespace(tries=0, old_etag='', old_timestamp=None))
+    url_job = cast(
+        'UrlJob', JobBase.unserialize({'url': 'https://www.example.com'}).with_defaults(config_storage.config)
+    )
+    assert dict(url_job.get_headers(job_state, user_agent=None)) == {'accept-language': 'en-US'}
+    browser_job = JobBase.unserialize({'url': 'https://www.example.com', 'use_browser': True})
+    browser_job = cast('BrowserJob', browser_job.with_defaults(config_storage.config))
+    assert dict(browser_job.get_headers(job_state, user_agent=None)) == {'dnt': '1', 'accept-language': 'en-US'}
+
+
+def test_load_job_defaults_null_cookie_removes_all_jobs_one(tmp_path: Path) -> None:
+    """A cookie set to null in url_jobs stops the all_jobs one from being sent by url jobs, but not by browser jobs."""
+    cfg = _write_config_job_defaults(
+        tmp_path,
+        {'all_jobs': {'cookies': {'consent': 1, 'session': 'abc'}}, 'url_jobs': {'cookies': {'session': None}}},
+    )
+    config_storage = YamlConfigStorage(cfg)
+    config_storage.load()
+    url_job = cast(
+        'UrlJob', JobBase.unserialize({'url': 'https://www.example.com'}).with_defaults(config_storage.config)
+    )
+    assert url_job.get_cookies() == {'consent': '1'}
+    browser_job = JobBase.unserialize({'url': 'https://www.example.com', 'use_browser': True})
+    browser_job = cast('BrowserJob', browser_job.with_defaults(config_storage.config))
+    assert browser_job.get_cookies() == {'consent': '1', 'session': 'abc'}
+
+
+def test_load_legacy_and_new_job_defaults_key(tmp_path: Path) -> None:
+    """A legacy job_defaults key alongside the job-kind one that replaces it is a duplicate."""
+    cfg = _write_config_job_defaults(tmp_path, {'url': {'timeout': 10}, 'url_jobs': {'timeout': 20}})
+    with pytest.raises(KeyError, match="Found both 'url' and 'url_jobs'"):
+        YamlConfigStorage(cfg).load()
+
+
+def test_load_reporter_configured_multiple_times(tmp_path: Path) -> None:
+    """A reporter configured with a list of configurations loads, and each entry is filled in with the defaults."""
+    cfg = _write_config(
+        tmp_path,
+        {
+            'report': {
+                'telegram': [
+                    {'enabled': True, 'bot_token': 'token', 'chat_id': '111', 'tags': ['personal']},
+                    {'enabled': True, 'bot_token': 'token', 'chat_id': '222', 'tags': 'team'},
+                ]
+            }
+        },
+    )
+    config = YamlConfigStorage(cfg)
+    config.load()
+    telegram = config.config['report']['telegram']
+    assert isinstance(telegram, list)
+    assert [c['chat_id'] for c in telegram] == ['111', '222']
+    assert [c['tags'] for c in telegram] == [['personal'], 'team']
+    # 'silent' is set in neither entry, so both get it from DEFAULT_CONFIG
+    assert [c['silent'] for c in telegram] == [False, False]
+
+
+def test_load_reporter_configured_multiple_times_with_bad_entry(tmp_path: Path) -> None:
+    """An entry of a reporter's list of configurations that is not a set of directives raises ValueError."""
+    cfg = _write_config(tmp_path, {'report': {'telegram': [{'enabled': True}, 'oops']}})
+    with pytest.raises(ValueError, match=r"^Reporter 'telegram' is configured with a list, but entry 2 of that list"):
+        YamlConfigStorage(cfg).load()
+
+
+def test_load_reporter_configured_multiple_times_with_unrecognized_directive(tmp_path: Path) -> None:
+    """An unrecognized directive in any entry of a reporter's list of configurations is still reported."""
+    cfg = _write_config(tmp_path, {'report': {'telegram': [{'enabled': True}, {'chat_ids': '222'}]}})
+    with pytest.warns(RuntimeWarning, match='chat_ids'):
+        YamlConfigStorage(cfg).load()
+
+
+def test_load_gotify_subject_and_deprecated_title(tmp_path: Path) -> None:
+    """The gotify reporter's 'subject' is recognized, and the deprecated 'title' is loaded as 'subject'."""
+    cfg = _write_config(tmp_path, {'report': {'gotify': [{'subject': 'one'}, {'title': 'two'}]}})
+    config = YamlConfigStorage(cfg)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        config.load()
+    gotify = config.config['report']['gotify']
+    assert isinstance(gotify, list)
+    assert [c['subject'] for c in gotify] == ['one', 'two']
+    assert all('title' not in c for c in gotify)
+
+
+def test_load_reporter_tags_are_not_unrecognized(tmp_path: Path) -> None:
+    """The 'tags' reporter directive, which has no default, is not flagged as unrecognized."""
+    cfg = _write_config(tmp_path, {'report': {'telegram': {'tags': ['personal']}}})
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        YamlConfigStorage(cfg).load()
 
 
 # @py37_required
@@ -623,6 +828,16 @@ def test_delete_latest(database_engine: SsdbStorage) -> None:
         assert len(history) == 1
 
 
+def test_delete_latest_temporary_sqlite3(ssdb_storage: SsdbSQLite3Storage) -> None:
+    """delete_latest(temporary=True) deletes the latest snapshot saved in this run (not yet in the permanent database)
+    and returns how many it deleted, counted in the temporary database."""
+    for timestamp, data in ((1.0, 'old'), (2.0, 'new')):
+        ssdb_storage.save(guid='guid', snapshot=Snapshot(data, timestamp, 0, '', 'text/plain', {}))
+    assert ssdb_storage.delete_latest('guid', temporary=True) == 1
+    ssdb_storage._copy_temp_to_permanent(delete=True)
+    assert [s.data for s in ssdb_storage.get_history_snapshots('guid')] == ['old']
+
+
 @pytest.mark.parametrize(
     'database_engine',
     DATABASE_ENGINES,
@@ -799,7 +1014,7 @@ def test_abstractmethods() -> None:
         filename: Path
 
     filename = Path('test')
-    d = DummyBaseTextualFileStorage(filename)
+    d = DummyBaseTextualFileStorage(filename)  # ty:ignore[call-non-callable]
     assert d.load() is None
     assert d.save() is None
     assert d.parse(Path()) is None
@@ -811,7 +1026,7 @@ def test_abstractmethods() -> None:
         filename: Path
 
     filename = Path('test')
-    dummy_ssdb = DummySsdbStorage(filename)
+    dummy_ssdb = DummySsdbStorage(filename)  # ty:ignore[call-non-callable]
     assert dummy_ssdb.close() is None
     assert dummy_ssdb.get_guids() is None
     assert dummy_ssdb.load('guid') is None

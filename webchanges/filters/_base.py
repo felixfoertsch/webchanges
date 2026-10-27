@@ -4,14 +4,16 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = ['itertools', 'warnings', 'yaml']
+
 import itertools
 import logging
 import warnings
-from typing import TYPE_CHECKING, Any, Iterator, Literal
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, NoReturn
 
 import yaml
 
-from webchanges.util import TrackSubClasses
+from webchanges.util import TrackSubClasses, missing_dependency
 
 if TYPE_CHECKING:
     import re
@@ -21,6 +23,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Filters usable as a bare string, i.e. those having no required sub-directive. Keep in sync with the
+# 'filterItem' string enum in webchanges/_resources/jobs.schema.json.
 FiltersList = Literal[
     'absolute_links',
     'ascii85',
@@ -32,12 +36,18 @@ FiltersList = Literal[
     'html2text',
     'ical2text',
     'jsontoyaml',
+    'ocr',
+    'pdf2text',
     'pretty-xml',
+    'pypdf',
+    'remove-duplicate-lines',
     'remove_repeated',
     'reverse',
     'sha1sum',
+    'sha256sum',
     'sort',
     'strip',
+    'striplines',
 ]
 
 
@@ -104,7 +114,7 @@ class FilterBase(metaclass=TrackSubClasses):
     @classmethod
     def normalize_filter_list(
         cls,
-        filter_spec: str | list[str | dict[str, Any]] | None,
+        filter_spec: str | Iterable[str | dict[str, Any]] | None,
         job_index_number: int | None = None,
     ) -> Iterator[tuple[str, dict[str, Any]]]:
         """Generates a list of filters that has been checked for its validity.
@@ -149,7 +159,7 @@ class FilterBase(metaclass=TrackSubClasses):
     @classmethod
     def _internal_normalize_filter_list(
         cls,
-        filter_spec: str | list[str | dict[str, Any]] | None,
+        filter_spec: str | Iterable[str | dict[str, Any]] | None,
         job_index_number: int | None = None,
     ) -> Iterator[tuple[str, dict[str, Any]]]:
         """Generates a list of filters with its default subfilter if not supplied.
@@ -259,17 +269,24 @@ class FilterBase(metaclass=TrackSubClasses):
         """
         raise NotImplementedError
 
-    def raise_import_error(self, package_name: str, filter_name: str, error_message: str) -> None:
-        """Raise ImportError for missing package.
+    def raise_import_error(
+        self, package_name: str, filter_name: str, error_message: ImportError | str, extra: str | None = None
+    ) -> NoReturn:
+        """Raise the standard ImportError for a package that the filter needs but cannot be imported.
 
-        :param package_name: The name of the module/package that could not be imported.
+        :param package_name: The name to install the package with (e.g. 'beautifulsoup4', not 'bs4').
         :param filter_name: The name of the filter that needs the package.
-        :param error_message: The error message from ImportError.
+        :param error_message: The ImportError raised when importing the package (or its message).
+        :param extra: The webchanges extra that installs the package, if any (e.g. 'bs4' for webchanges[bs4]).
 
         :raises: ImportError.
         """
-        raise ImportError(
-            f"Filter {filter_name} requires package '{package_name}', which has the following error: {error_message}"
+        raise missing_dependency(
+            error_message,
+            package_name,
+            used_by=f"the '{filter_name}' filter",
+            extra=extra,
+            location=self.job.get_indexed_location(),
         )
 
 

@@ -12,7 +12,7 @@ The global configuration for :program:`webchanges` contains basic settings for t
 format**, is called ``config.yaml``, and is located in the following directory:
 
 * Linux: ``~/.config/webchanges``
-* MacOS: ``~/Library/Preferences/webchanges``
+* MacOS: ``~/Library/Application Support/webchanges``
 * Windows: ``%USERPROFILE%/Documents/webchanges`` (the webchanges folder within your Documents folder)
 
 It can be edited with any text editor or with:
@@ -33,6 +33,9 @@ configuration file:
 
    _note: This is a remark
 
+.. tip:: Credentials and other secrets (e.g. a reporter's token or password) can be kept out of the configuration
+   file by storing them in environment variables and inserting them with the ``!env`` tag; see
+   :ref:`environment_variables`.
 
 .. versionchanged:: 3.11
    Keys starting with an underscore (``_``) are ignored.
@@ -142,15 +145,17 @@ Reporters are implemented in a hierarchy, and configuration settings of a report
 Job defaults
 ------------
 If you want to apply or change default settings for all your jobs, add them to the ``job_defaults`` section in your
-config file. The following example will set default headers for all ``url`` jobs without ``use_browser``:
+config file. Under it, each sub-directive names a job kind, and holds the job directives that apply by default to the
+jobs of that kind, written exactly as they would be in a job. The following example will set default headers for all
+``url`` jobs without ``use_browser``:
 
 .. code-block:: yaml
 
    job_defaults:
-     all:
+     all_jobs:
        _note: Default directives that are applied to all job kinds.
        suppress_repeated_errors: true
-     url:
+     url_jobs:
        _note: These are defaults for URL jobs without 'use_browser'.
        headers:
          Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
@@ -168,22 +173,85 @@ config file. The following example will set default headers for all ``url`` jobs
          Upgrade-Insecure-Requests: 1
          User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36
 
-The above config file sets all jobs to use the suppress_repeated_errors option and ``url`` jobs without the ``browser``
-directive to use the specified headers.
+The above config file sets all jobs to use the suppress_repeated_errors option and ``url`` jobs without the
+``use_browser`` directive to use the specified headers, as if each of these jobs contained the same ``headers``
+directive, e.g.:
+
+.. code-block:: yaml
+
+   url: https://example.com/
+   headers:
+     Accept-Language: en-US,en;q=0.9
+     # (...)
 
 The possible sub-directives to ``job_defaults`` are:
 
-* ``all``: Applies to all your jobs, including those in hooks.py;
-* ``url``: Applies only to jobs with the directive ``url`` without ``use_browser``;
-* ``browser``: Applies only to jobs with the directives ``url`` and ``use_browser: true``;
-* ``command``: Applies only to jobs with the directive ``command``.
+* ``all_jobs``: Applies to all your jobs, including those in hooks.py;
+* ``url_jobs``: Applies only to jobs with the directive ``url`` without ``use_browser``;
+* ``browser_jobs``: Applies only to jobs with the directives ``url`` and ``use_browser: true``;
+* ``command_jobs``: Applies only to jobs with the directive ``command``.
 
 See :ref:`jobs <jobs>` for an explanation of the different job kinds and their directives.
 
 Handling of duplicate directives
 ````````````````````````````````
-Any directive specified in either ``url``, ``browser`` or ``command`` will override the same directive specified in
-``all``.  In case of the ``headers`` directive, the overriding is done on a header-by-header basis.
+A directive specified in a job overrides the same directive specified in ``job_defaults``, and one specified in
+``url_jobs``, ``browser_jobs`` or ``command_jobs`` overrides the same one specified in ``all_jobs``.
+
+Directives whose value is a set of key-value pairs, such as ``headers`` and ``cookies``, are instead merged one key at a
+time, with the same precedence: each header is taken from the job if the job specifies it, otherwise from
+``url_jobs`` (or ``browser_jobs``) if specified there, otherwise from ``all_jobs``. Header names are matched
+case-insensitively. For example, with this configuration:
+
+.. code-block:: yaml
+
+   job_defaults:
+     all_jobs:
+       headers:
+         Accept-Language: en-US,en;q=0.9
+         User-Agent: Mozilla/5.0
+     url_jobs:
+       headers:
+         DNT: 1
+         User-Agent: Chrome
+
+this job:
+
+.. code-block:: yaml
+
+   url: https://lynx.invisible-island.net
+   headers:
+     user-agent: Lynx
+
+is sent the headers ``Accept-Language: en-US,en;q=0.9``, ``DNT: 1`` and ``user-agent: Lynx``.
+
+To remove a default header or cookie, set it to null (no value): it is then not sent, and no less specific default can
+supply it. This works both in a job, to remove a header or cookie set in ``job_defaults``, and in ``url_jobs`` or
+``browser_jobs``, to remove one set in ``all_jobs``. Continuing the example above, this job is sent only the header
+``Accept-Language: en-US,en;q=0.9`` and, as no ``User-Agent`` header is left, :program:`webchanges`' own default one:
+
+.. code-block:: yaml
+
+   url: https://lynx.invisible-island.net
+   headers:
+     DNT:
+     User-Agent:
+
+Directives whose value is a list, such as ``filters``, are not merged: the one specified in the job replaces the
+default one entirely.
+
+.. versionchanged:: 3.38
+   A header or cookie set to null removes the default one; previously, it was sent with the value ``None``.
+
+Previous names
+``````````````
+These sub-directives were previously named ``all``, ``url``, ``browser`` and ``command`` (the latter originally
+``shell``), as in :program:`urlwatch`. These names continue to work unchanged, but cannot be used together with the
+new name of the same sub-directive (e.g. ``url`` together with ``url_jobs``).
+
+.. versionchanged:: 3.38
+   Renamed the sub-directives from ``all``, ``url``, ``browser`` and ``command`` to ``all_jobs``, ``url_jobs``,
+   ``browser_jobs`` and ``command_jobs``.
 
 
 .. _differ_defaults:
@@ -323,6 +391,40 @@ release of :program:`webchanges`, whose result appears in report footers. Set it
 The ``--check-new`` command line argument always queries PyPi, regardless of this setting.
 
 .. versionadded:: 3.37
+
+
+
+.. _config_jobs:
+
+.. _config_hooks:
+
+Jobs and hooks files
+--------------------
+The top-level ``jobs`` and ``hooks`` directives select the jobs and hooks files to use instead of the default
+``jobs.yaml`` and ``hooks.py``, so that you don't need to type the ``--jobs`` and ``--hooks`` command line arguments at
+every run. Each takes a file, a `glob pattern <https://en.wikipedia.org/wiki/Glob_(programming)>`__ or a directory, or a
+list of these:
+
+.. code-block:: yaml
+
+   jobs: jobs  # every *.yaml file in the jobs directory and its subdirectories
+   hooks:
+     - hooks.py
+     - hooks/*.py
+
+* Relative paths are taken from the directory of the configuration file (not the current one), and ``~`` stands for the
+  home directory.
+* A directory stands for every file in its tree with the ``.yaml`` (``jobs``) or ``.py`` (``hooks``) suffix; a glob
+  pattern can include ``**`` to match any number of subdirectories (e.g. ``jobs/**/*.yaml``).
+* The files found are used in the order listed, with those matching the same pattern or directory in alphabetical
+  order; with multiple jobs files, their contents are combined in that order.
+* The same :ref:`smart file specification <smart-file-specification>` as the command line arguments applies (e.g.
+  ``jobs: test`` will also look for ``test.yaml``, ``jobs-test`` and ``jobs-test.yaml``).
+* The ``--jobs`` and ``--hooks`` command line arguments override these directives.
+
+If set to ``null`` (the default) or omitted, the default files are used.
+
+.. versionadded:: 3.38
 
 
 

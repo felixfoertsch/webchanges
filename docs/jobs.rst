@@ -64,6 +64,9 @@ YAML :ref:`here <yaml_syntax>`.
 * You can learn more about quoting special characters `here <https://www.yaml.info/learn/quote.html#flow>`__ (the
   library we use supports YAML 1.1, and our examples use "flow scalars"). URLs and XPaths are always safe and don't
   need to be enclosed in quotes.
+* Environment variables: the value of any environment variable can be inserted anywhere within a directive's string
+  value by tagging the value with ``!env`` and referencing the variable as ``${VAR}``; see
+  :ref:`environment_variables`.
 
 For additional information on YAML, see the :ref:`yaml_syntax` page and the references at the bottom of that page.
 
@@ -262,10 +265,23 @@ cookies
 ^^^^^^^
 Cookies to send with the request (a dict).
 
-See examples :ref:`here <cookies>`.
+The cookies found in a job are merged one cookie at a time with the default ones set in ``job_defaults`` in
+``config.yaml``: a cookie in the job replaces only the default cookie of the same name, and all the other default
+cookies are still sent. To stop a default cookie from being sent, set it to null (no value) in the job:
+
+.. code-block:: yaml
+
+   url: https://example.com/
+   cookies:
+     session_id:  # removes the session_id cookie set in job_defaults in config.yaml
+
+See :ref:`here <job_defaults>` for how the defaults set for all jobs and for a job kind are combined.
 
 .. versionchanged:: 3.0
    Works for all ``url`` jobs, including those with ``use_browser: true``.
+
+.. versionchanged:: 3.38
+   A cookie set to null removes the default one; previously, it was sent with the value ``None``.
 
 
 .. _data:
@@ -358,13 +374,26 @@ headers
 ^^^^^^^
 Headers to send along with the request (a dict).
 
-The headers found in a job are merged case-insensitively with the default ones (including those found in ``config
-.yaml``).  In case of conflicts, the header in the job will replace the default one.
+The headers found in a job are merged one header at a time, case-insensitively, with the default ones (including those
+set in ``job_defaults`` in ``config.yaml``): a header in the job replaces only the default header of the same name, and
+all the other default headers are still sent. To stop a default header from being sent, set it to null (no value)
+in the job:
+
+.. code-block:: yaml
+
+   url: https://example.com/
+   headers:
+     Referer:  # removes the Referer header set in job_defaults in config.yaml
+
+See :ref:`here <job_defaults>` for how the defaults set for all jobs and for a job kind are combined.
+
+.. versionchanged:: 3.38
+   A header set to null removes the default one; previously, it was sent with the value ``None``.
 
 See examples :ref:`here <default_headers>`.
 
-Jobs without ``browser: true``
-******************************
+Jobs without ``use_browser: true``
+**********************************
 The default headers are:
 
 .. code-block:: yaml
@@ -375,11 +404,11 @@ The default headers are:
    connection: 'keep-alive'
    user-agent: # set by the HTTP client, e.g. 'python-httpx/0.27.0'
 
-Jobs with ``browser: true``
-***************************
+Jobs with ``use_browser: true``
+*******************************
 The default headers are set by the browser.
 
-Note that if the :ref:`referer <referer>` directive if specified, its contents will replace the content of the `Referer
+Note that if the :ref:`referer <referer>` directive is specified, its contents will replace the content of the `Referer
 <https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Referer>`__ header.
 
 
@@ -515,7 +544,7 @@ E.g. ``https://username:password@proxy.com:8080``.
    Works for all ``url`` jobs, including those with ``use_browser: true``.
 
 .. versionchanged:: 3.28
-   Replaces two separate directives, ``http_proxy`` and ``https_proxy``.
+   Replaces two separate directives, ``http_proxy`` and ``https_proxy``, which are still recognized.
 
 
 .. _no_conditional_request:
@@ -568,43 +597,9 @@ the easiest way to protect all your sites at once.
    sharing a network location.
 
 
-
 Optional directives for ``url`` jobs without ``use_browser: true``
 ------------------------------------------------------------------
 The following directives are available only for ``url`` jobs without ``use_browser: true``:
-
-
-.. _empty_as_transient:
-
-empty_as_transient
-^^^^^^^^^^^^^^^^^^
-Treat an empty response from the server as a transient HTTP error instead of as valid (empty) content (true/false).
-Defaults to false.
-
-This is useful with flaky websites (or CDNs) that every now and then return an empty page instead of the content
-being monitored. Without this directive, the empty response is saved as the new snapshot, and you receive a change
-report when the content "disappears" as well as another one when it is restored — even if it is restored to the
-exact same content as before.
-
-When this directive is set to true and the server returns no data, the run is handled like a transient HTTP error
-(with the synthetic HTTP response status code 999): the snapshot database retains the last non-empty content and,
-once the site returns data again, any change is computed against that content, so a mere restoration does not
-trigger a change report.
-
-An empty response is still reported as an error (subject to :ref:`max_tries`), so combine this directive with one of
-the following to control error reporting:
-
-* ``max_tries: 3`` (for example), to be notified only if the response is empty for 3 consecutive runs, or
-* ``ignore_http_error_codes: 999``, to never be notified of empty responses (see :ref:`ignore_http_error_codes`).
-
-.. code-block:: yaml
-
-   # yaml-language-server: $schema=jobs.schema.json
-   url: https://example.com/flaky
-   empty_as_transient: true
-   ignore_http_error_codes: 999
-
-.. versionadded:: 3.37
 
 
 .. _http_client:
@@ -695,7 +690,34 @@ doesn't rely on a DH key and therefore doesn't trigger the error.
 Set it as a last resort if you're getting a ``ssl.SSLError: [SSL: DH_KEY_TOO_SMALL] dh key too small (_ssl.c:1129)``
 error and can't get the anyone to fix the security vulnerability on the server.
 
+It works by lowering the OpenSSL security level to 1 for the job's connections, which accepts a 1024-bit
+Diffie-Hellman key; certificates are still verified (unless :ref:`ssl_no_verify` is set).
+
+This directive is supported by the ``httpx`` (default) and ``requests`` HTTP clients, but not by ``http_client:
+curl_cffi``.
+
 .. versionadded:: 3.9.2
+
+.. versionchanged:: 3.38
+   Fixed: with ``http_client: httpx`` it made every HTTPS request fail with a certificate verification error, and with
+   ``http_client: requests`` it had no effect with version 2.x of the ``urllib3`` library.
+
+
+.. _ignore_incomplete_reads:
+
+ignore_incomplete_reads
+^^^^^^^^^^^^^^^^^^^^^^^
+Ignore error if the server closes the connection before sending the complete response (true/false). Defaults to false.
+
+The error is ``httpx.RemoteProtocolError`` with ``http_client: httpx`` (e.g. ``peer closed connection without sending
+complete message body: incomplete chunked read``), ``requests.exceptions.ChunkedEncodingError`` with ``http_client:
+requests``, and ``ChunkedEncodingError`` or ``IncompleteRead`` with ``http_client: curl_cffi``.
+
+Not supported by jobs with ``use_browser: true``.
+
+See more :ref:`here <ignoring_http_connection_errors>`.
+
+.. versionadded:: 3.39
 
 
 .. _impersonate:
@@ -816,10 +838,23 @@ Example (equivalent to the URL https://example.com/?Element1=Data&Element2=Other
 
 retries
 ^^^^^^^
-Number of times to retry a url after receiving an error before giving up (a number). Default 0.
+Number of times to retry the request when it fails with an error that a new attempt could overcome, before reporting
+the error (a number). Defaults to 0 (no retry).
 
-Setting it to 1 will often solve the ``('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))``
-error received when attempting to connect to a misconfigured server.
+The errors retried are:
+
+* connection errors, such as the ``('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))``
+  received when attempting to connect to a misconfigured server, which setting ``retries: 1`` will often solve;
+* timeouts (see :ref:`timeout`);
+* the transient HTTP response status codes 429 (Too Many Requests), 500 (Internal Server Error), 502 (Bad Gateway),
+  503 (Service Unavailable) and 504 (Gateway Timeout).
+
+Other errors, such as a 404 (Not Found), are reported at once, as retrying cannot fix them.
+
+Between attempts, :program:`webchanges` waits for the time requested by the server in the ``Retry-After`` header of a
+429 or 503 response, up to 60 seconds, or else for 1 second after the first failed attempt, 2 seconds after the second,
+4 after the third, and so on, up to 30 seconds. The retries are made within the same run; to instead be notified of an
+error only after it has persisted across several runs, use :ref:`max_tries`.
 
 .. code-block:: yaml
 
@@ -828,6 +863,11 @@ error received when attempting to connect to a misconfigured server.
    retries: 1
    filters:
      - html2text:
+
+.. versionadded:: 3.13
+
+.. versionchanged:: 3.38
+   The directive, which had no effect, is now implemented, as described above.
 
 
 .. _ssl_no_verify:
@@ -1204,6 +1244,13 @@ in a folder, output of scripts that query external devices (RPi GPIO), and many 
    name: What is in my home directory?
    command: dir -al ~
 
+The ``command`` and :ref:`url <url>` directives are mutually exclusive, as each one defines a different job type: a
+job containing both is rejected with an error.
+
+.. versionchanged:: 3.38
+   A job containing both ``command`` and ``url`` is now rejected; previously it ran as a ``command`` job, silently
+   ignoring the ``url`` directive.
+
 .. _important_note_for_command_jobs:
 
 .. important:: On Linux and macOS systems, due to security reasons, a ``command`` job or a job with a ``command`` differ
@@ -1265,6 +1312,32 @@ Required directives
 command
 ^^^^^^^
 The shell command to execute.
+
+Optional directives
+-------------------
+
+.. _stderr:
+
+stderr
+^^^^^^
+What to do with the command's standard error output (a string). Defaults to ``ignore``.
+
+* ``ignore``: report it only when the command fails (exits with a non-zero code), as part of the error;
+* ``forward``: as ``ignore``, but also write it to :program:`webchanges`' own standard error (e.g. the terminal, or
+  the email that ``cron`` sends);
+* ``fail``: fail the job if the command writes anything to standard error, even if it exits with code 0;
+* ``stdout``: merge it into the standard output (like ``2>&1`` in the shell), so that it becomes part of the data that
+  is filtered and compared.
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=jobs.schema.json
+   name: Disk usage, including permission errors
+   command: du -sh ~/*
+   stderr: stdout
+
+.. versionchanged:: 3.39
+   Implemented (for backward compatibility); previously a job with this directive failed.
 
 Optional directives for all job types
 =====================================
@@ -1353,11 +1426,58 @@ with:
    * Output from ``diff_tool: wdiff`` is colorized in html reports.
 
 
+.. _empty_as_error:
+
+empty_as_error
+--------------
+Treat empty data as an error instead of as valid (empty) content (true/false/``ignore``). Defaults to false.
+
+This is useful with flaky websites (or CDNs) that every now and then return an empty page, or a page lacking the
+content being monitored, and with commands that occasionally produce no output. Without this directive, the empty data
+is saved as the new snapshot, and you receive a change report when the content "disappears" as well as another one when
+it is restored — even if it is restored to the exact same content as before.
+
+Data is empty when the response or command output is empty, or when the :ref:`filters <filters_job_directive>` leave
+nothing of it (e.g. an ``xpath`` filter selecting an element that is missing from the page this time). Data consisting
+only of whitespace (e.g. a lone newline, which a shell command emits very easily) counts as empty.
+
+When this directive is set to true and the data is empty, the run is handled like a transient HTTP error (with the
+synthetic HTTP response status code 999): the snapshot database retains the last non-empty content and, once the job
+returns data again, any change is computed against that content, so a mere restoration does not trigger a change
+report.
+
+For jobs with ``use_browser: true``, the response is checked on the raw network response, as the rendered page source
+is never empty (the browser always builds a minimal document skeleton). A page that renders without the content being
+monitored (e.g. because client-side JavaScript has not yet populated it) is caught after filtering instead. If the
+content is merely slow to appear, consider also adding the :ref:`wait_for_selector` directive so that the job waits for
+it and captures it.
+
+When set to true, empty data is still reported as an error (subject to :ref:`max_tries`), so it can be combined with
+``max_tries: 3`` (for example) to be notified only if the data is empty for 3 consecutive runs. Set it to ``ignore``
+instead to never be notified of empty data: the last non-empty snapshot is silently kept and nothing is reported,
+whatever the job kind. Note that ``ignore_connection_errors`` does **not** silence it, as the server did respond.
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=jobs.schema.json
+   url: https://example.com/flaky
+   use_browser: true
+   empty_as_error: ignore
+   filters:
+     - xpath: //table[@id="prices"]//tr[3]/td[6]
+     - html2text
+
+.. versionadded:: 3.38
+
+
 .. _enabled:
 
 enabled
 -------
 Convenience setting to disable running the job while leaving it in the jobs file (true/false). Defaults to true.
+
+The command line arguments ``--disable`` and ``--enable`` set it for you, but rewrite the jobs file, losing all its
+remarks (see :ref:`here <enable_disable>`).
 
 .. versionadded:: 3.18
 
@@ -1375,6 +1495,36 @@ Can be tested with ``--test``.
 .. versionchanged:: 3.28
    Renamed from ``filter`` (singular).
 
+
+.. _hook_data:
+
+hook_data
+---------
+For Python programmers only, this carries any data (typically a mapping of names to values) to your own code in
+``hooks.py``: a custom job Class (see :ref:`kind`) reads it as ``self.hook_data``, and a custom filter, differ or
+reporter as ``self.job.hook_data``. :program:`webchanges` itself does not use it. Example:
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=jobs.schema.json
+   url: https://example.com/flights/status
+   hook_data:
+     flight: XY123
+     arrival_day_offset: 1
+   filters:
+     - hooks_flight_status:
+
+This allows you to write a single custom Class that serves many jobs, each passing its own data. See
+:ref:`here <hooks>` for an example.
+
+A custom job Class could instead accept directives of its own by listing them in its ``__required__`` or
+``__optional__`` attribute, and :program:`webchanges` would pass them to the job. However, editors that validate the
+jobs file against its JSON Schema (``jobs.schema.json``) flag them as errors, as the schema does not know them.
+``hook_data`` is defined in the schema, so a job using it passes validation, whatever data it carries.
+
+.. versionadded:: 3.38
+
+
 .. _kind:
 
 kind
@@ -1384,8 +1534,8 @@ matching the contents of this directive to the ``__kind__`` variable of the cust
 
 The three built-in job Classes are:
 
-- ``kind: url`` for ``url`` jobs without the ``browser`` directive;
-- ``kind: browser`` for ``url`` jobs with the ``browser: true`` directive;
+- ``kind: url`` for ``url`` jobs without the ``use_browser`` directive;
+- ``kind: browser`` for ``url`` jobs with the ``use_browser: true`` directive;
 - ``kind: command`` for ``command`` jobs (formerly called ``shell``).
 
 
@@ -1393,9 +1543,79 @@ The three built-in job Classes are:
 
 is_markdown
 -----------
-Data is in Markdown format (true/false). Defaults to false unless set by a filter such as ``html2text``.
+Data is in Markdown format (true/false). Defaults to false unless the media type is ``text/markdown`` (from a website
+or set by a filter, such as ``html2text``).
 
 Tells the ``html`` report that the data is in Markdown format and should be reconstructed into HTML.
+
+
+.. _is_rst:
+
+is_rst
+------
+Data is in reStructuredText format (true/false). Defaults to false unless the media type is ``text/x-rst``.
+
+Tells the ``html`` report that the data is in reStructuredText format and should be reconstructed into HTML.
+
+
+.. _markdown_extras:
+
+markdown_extras
+---------------
+Options for the `markdown2 <https://github.com/trentm/python-markdown2>`__ library used to convert Markdown data (see
+:ref:`is_markdown`) into HTML for the ``html`` and ``email`` reports, as a dict of its `extras
+<https://github.com/trentm/python-markdown2/wiki/Extras>`__: the name of each extra, followed by its options or by
+nothing (``null``) if it takes none.
+
+The extras specified are applied over the following ones, which :program:`webchanges` always uses:
+
+* ``strike``: text enclosed in double tildes is ``~~struck through~~``;
+* ``target-blank-links``: links open in a new tab or window;
+* ``middle-word-em: false``: emphasis markers within a word are left as they are, so that ``snake_case_name`` is not
+  rendered as snake\ *case*\ name.
+
+To reinstate the emphasis within words (the library's default), for example:
+
+.. code-block:: yaml
+
+   url: https://example.com/
+   markdown_extras:
+     middle-word-em: true
+
+Or, to also render straight quotes and double dashes as typographic ones (“curly quotes” and en dashes):
+
+.. code-block:: yaml
+
+   url: https://example.com/
+   markdown_extras:
+     smarty-pants:
+
+Note that the data of a report is converted one line at a time, so extras that act on blocks of lines (e.g.
+``tables`` or ``fenced-code-blocks``) have no effect there.
+
+The directive can be set for all jobs, or for all jobs of a kind, with ``job_defaults`` in the configuration file
+(see :ref:`here <job_defaults>`).
+
+.. versionadded:: 3.38
+
+
+.. _markdown_padded_tables:
+
+markdown_padded_tables
+----------------------
+Show the rows of Markdown tables (i.e. the lines containing a ``|``) in a monospace font when Markdown data (see
+:ref:`is_markdown`) is rendered as HTML for the ``html`` and ``email`` reports (true/false), so that the columns of a
+table padded with spaces line up. Defaults to false.
+
+It is set automatically to the value of the ``pad_tables`` sub-directive of the ``html2text`` filter (see
+:ref:`here <html2text>`), so it is normally needed only when the padded tables come from elsewhere, for example:
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=jobs.schema.json
+   command: python3 make_table.py
+   is_markdown: true
+   markdown_padded_tables: true
 
 
 .. _max_tries:
@@ -1430,6 +1650,24 @@ tabular data extracted by the ``pdf2text`` filter.
 .. versionchanged:: 3.20
    Default setting can be overridden by a filter or differ.
 
+
+.. _name:
+
+name
+----
+Human-readable name/label of the job used in reports (a string).
+
+If this directive is not specified, the label used in reports will either be the ``url`` or the ``command`` itself or,
+for ``url`` jobs retrieving HTML or XML data, the first 60 character of the contents of the <title> field if found.
+
+While jobs are executed in parallel for speed, they appear in the report in alphabetical order by name, so
+you can control the order in which they appear through their naming.
+
+.. versionchanged:: 3.0
+   Added auto-detect <title> tag in HTML or XML.
+
+.. versionchanged:: 3.11
+   Reports are sorted by job name.
 
 .. _note:
 
@@ -1494,23 +1732,60 @@ be notified only if the error resolves or a different error occurs.
 .. versionadded:: 3.27
 
 
-.. _name:
+.. _tags:
 
-name
+tags
 ----
-Human-readable name/label of the job used in reports (a string).
+One tag, or a list of tags, used to group jobs (a string or a list of strings).
 
-If this directive is not specified, the label used in reports will either be the ``url`` or the ``command`` itself or,
-for ``url`` jobs retrieving HTML or XML data, the first 60 character of the contents of the <title> field if found.
+Tags do nothing by themselves; they let you act on a group of jobs:
 
-While jobs are executed in parallel for speed, they appear in the report in alphabetical order by name, so
-you can control the order in which they appear through their naming.
+* on the command line, ``--tags`` runs only the jobs having any of the tags listed (see :ref:`here <tags_cli>`);
+* in the configuration file, a reporter's ``tags`` directive restricts that reporter to the jobs having any of the
+  tags listed, which (combined with configuring the same reporter more than once) allows different jobs to be
+  reported to different destinations (see :ref:`here <reporter_tags>`).
 
-.. versionchanged:: 3.0
-   Added auto-detect <title> tag in HTML or XML.
+.. code-block:: yaml
 
-.. versionchanged:: 3.11
-   Reports are sorted by job name.
+   # yaml-language-server: $schema=jobs.schema.json
+   name: Bank balance
+   url: https://example.com/balance
+   tags: personal
+   ---
+   # yaml-language-server: $schema=jobs.schema.json
+   name: Service status
+   url: https://example.com/status
+   tags:
+     - team
+     - ops
+
+A job with no ``tags`` directive is never selected by ``--tags`` nor by a reporter's ``tags`` directive; it is
+reported by every reporter that has no ``tags`` directive of its own.
+
+.. versionadded:: 3.38
+
+
+.. _treat_new_as_changed:
+
+treat_new_as_changed
+--------------------
+Report a new job as changed instead of new (true/false). Defaults to false.
+
+The first time a job runs successfully, :program:`webchanges` normally reports it as new, showing its content. With
+``treat_new_as_changed: true``, it reports the job as changed instead, with the content shown as a diff from empty
+content (every line added). The job's :ref:`differ <differs>` and :ref:`diff_filters <diff_filters_job_directive>`
+then apply from the first run, and the job is reported under ``display: changed`` rather than ``display: new`` (see
+:ref:`configuration_display`).
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=jobs.schema.json
+   url: https://example.com/announcements
+   treat_new_as_changed: true
+   additions_only: true
+
+.. versionadded:: 3.39
+   For backward compatibility.
 
 
 .. _user_visible_url:

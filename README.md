@@ -1,17 +1,17 @@
-This fork follows upstream [webchanges](https://github.com/mborsetti/webchanges) with ordered patches [0001](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0001-add-OpenAI-compatible-AI-differ-with-email-integration-coverage.patch), [0002](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0002-support-file-backed-AI-API-keys.patch), [0003](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0003-support-quiet-AI-change-filtering.patch), [0004](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0004-add-compact-HTML-change-digests.patch), [0005](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0005-suppress-AI-failures-from-change-reports.patch), [0006](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0006-show-actionable-fetch-errors-after-digest-content.patch), [0007](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0007-handle-streamed-newsletter-summaries-reject-silent-failures.patch), [0008](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0008-forward-reasoning-effort-to-OpenAI-compatible-models.patch). `patch-queue` owns workflows and patches; generated `main` contains upstream source plus all patches. Stable builds follow upstream releases; nightly builds follow upstream default branch.
+# webchanges hard fork
 
-# Patched webchanges
+This independently maintained fork integrates upstream v3.39.0 and all eight historical fork features. `main` owns source and release automation; edit source directly. Upstream updates are manual integrations, not automatic synchronization.
 
-Applied patches, oldest first:
+## Builds and releases
 
-1.  [0001-add-OpenAI-compatible-AI-differ-with-email-integration-coverage.patch](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0001-add-OpenAI-compatible-AI-differ-with-email-integration-coverage.patch)
-2.  [0002-support-file-backed-AI-API-keys.patch](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0002-support-file-backed-AI-API-keys.patch)
-3.  [0003-support-quiet-AI-change-filtering.patch](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0003-support-quiet-AI-change-filtering.patch)
-4.  [0004-add-compact-HTML-change-digests.patch](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0004-add-compact-HTML-change-digests.patch)
-5.  [0005-suppress-AI-failures-from-change-reports.patch](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0005-suppress-AI-failures-from-change-reports.patch)
-6.  [0006-show-actionable-fetch-errors-after-digest-content.patch](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0006-show-actionable-fetch-errors-after-digest-content.patch)
-7.  [0007-handle-streamed-newsletter-summaries-reject-silent-failures.patch](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0007-handle-streamed-newsletter-summaries-reject-silent-failures.patch)
-8.  [0008-forward-reasoning-effort-to-OpenAI-compatible-models.patch](https://github.com/felixfoertsch/webchanges/blob/patch-queue/patches/0008-forward-reasoning-effort-to-OpenAI-compatible-models.patch)
+- Push to `main`: nightly wheel and sdist on [GitHub Releases](https://github.com/felixfoertsch/webchanges/releases). Release tag `nightly-<full commit SHA>` and package version `<application version>+nightly.<full commit SHA>` identify immutable source. Rebuilding that commit reuses its identity; existing bytes must match or publication stops.
+- Push version tag `v<application version>` (for example `v3.39.0`): immutable stable GitHub release. Tag version must match `webchanges/__init__.py`.
+- No fork packages publish to PyPI. Install downloaded fork wheels with `python -m pip install ./webchanges-<version>-py3-none-any.whl`.
+- Builds run without write credentials. Separate publisher verifies source revision and artifact hashes; retries fill missing draft assets without replacing mismatched bytes.
+
+Historical [patch-queue](https://github.com/felixfoertsch/webchanges/tree/patch-queue) remains preserved for provenance, not live source ownership. Integrated features: OpenAI-compatible AI differ, file-backed API keys, quiet change filtering, compact HTML digests, AI-failure suppression, actionable fetch errors, streamed newsletter summaries, and reasoning-effort forwarding.
+
+The following upstream documentation is retained for reference; its upstream PyPI installation and release instructions do not describe this fork’s distribution.
 
 ------------------------------------------------------------------------
 
@@ -21,15 +21,16 @@ Applied patches, oldest first:
 
 ## Highlights
 
-- **AI-powered change summaries** via Gemini ([ai_google differ](https://webchanges.readthedocs.io/en/stable/differs.html#ai-google-diff), BETA).
-- **Structural diffs for JSON and XML** via the [deepdiff differ](https://webchanges.readthedocs.io/en/stable/differs.html#deepdiff-diff).
-- **Visual diffs for images** via the [image differ](https://webchanges.readthedocs.io/en/stable/differs.html#image-diff) (BETA).
-- **Bypass TLS/JA3 fingerprinting** with the optional [curl_cffi](https://webchanges.readthedocs.io/en/stable/jobs.html#http-client) HTTP client.
-- **JSON-Schema-validated** `jobs.yaml` and `config.yaml` for editor autocompletion and inline validation.
+- **Watch anything**: web pages (in a [real browser](https://webchanges.readthedocs.io/en/stable/jobs.html#use-browser) if needed), APIs, local files and command output.
+- **Track only what matters** with over 30 [filters](https://webchanges.readthedocs.io/en/stable/filters.html).
+- **Read changes at a glance** in formatted HTML, side by side, word by word, as [AI summaries](https://webchanges.readthedocs.io/en/stable/differs.html#ai-google-diff) and more.
+- **Get notified anywhere**: email, Telegram, Discord, ntfy, webhooks and [more](https://webchanges.readthedocs.io/en/stable/reporters.html).
+- **Few false alarms**: transient errors can be held back and repeated ones reported [once](https://webchanges.readthedocs.io/en/stable/jobs.html#suppress-repeated-errors).
+- **Runs on your machine**, total privacy, no account needed, and extends with Python [hooks](https://webchanges.readthedocs.io/en/stable/hooks.html).
 
 ## Requirements
 
-**webchanges** requires [![Supported Python versions](https://img.shields.io/pypi/pyversions/webchanges.svg)](https://www.python.org/downloads/). For the best experience, use the current version of [Python](https://www.python.org/downloads/); older Python versions are supported for 3 years after they're replaced. Free-threaded Python is supported, though some optional dependencies may not be.
+**webchanges** requires [![Supported Python versions](https://img.shields.io/pypi/pyversions/webchanges.svg)](https://www.python.org/downloads/). For the best experience, use the current version of [Python](https://www.python.org/downloads/); older Python versions are supported for 3 years after they're replaced. Free-threaded Python is supported.
 
 For Generative AI summaries (BETA), you need a free [API Key from Google Cloud AI Studio](https://aistudio.google.com/app/apikey) (see [here](https://webchanges.readthedocs.io/en/stable/differs.html#ai-google-diff)).
 
@@ -48,6 +49,8 @@ or with `pip`:
 ``` bash
 pip install webchanges
 ```
+
+On Windows with Python 3.15, first run `set PYYAML_FORCE_LIBYAML=0` (in PowerShell: `$env:PYYAML_FORCE_LIBYAML = "0"`), as explained [here](https://webchanges.readthedocs.io/en/stable/introduction.html#install-windows).
 
 ### Other ways to run
 
@@ -92,7 +95,7 @@ webchanges
 
 ## Code
 
-[![Code coverage by Coveralls](https://img.shields.io/coverallsCoverage/github/mborsetti/webchanges.svg)](https://coveralls.io/github/mborsetti/webchanges?branch=main) [![Issues at https://github.com/mborsetti/webchanges/issues](https://img.shields.io/github/issues-raw/mborsetti/webchanges)](https://github.com/mborsetti/webchanges/issues) [![Code style ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff) [![OpenSSF Scoreard](https://api.scorecard.dev/projects/github.com/mborsetti/webchanges/badge)](https://scorecard.dev/viewer/?uri=github.com/mborsetti/webchanges)
+[![Code coverage by Coveralls](https://img.shields.io/coverallsCoverage/github/mborsetti/webchanges.svg)](https://coveralls.io/github/mborsetti/webchanges?branch=main) [![Issues at https://github.com/mborsetti/webchanges/issues](https://img.shields.io/github/issues-raw/mborsetti/webchanges)](https://github.com/mborsetti/webchanges/issues) [![Code style ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 
 The code, issues tracker, and discussions are hosted on [GitHub](https://github.com/mborsetti/webchanges).
 
@@ -110,4 +113,4 @@ See the [complete licenses](https://raw.githubusercontent.com/mborsetti/webchang
 
 ## Relationship with **urlwatch**
 
-This project is a fork of [urlwatch 2.21](https://github.com/thp/urlwatch/tree/346b25914b0418342ffe2fb0529bed702fddc01f) and has since added many features; see the [comparison](https://webchanges.readthedocs.io/en/stable/_static/webchanges-vs-urlwatch.html).
+This project is a fork of [urlwatch 2.21](https://github.com/thp/urlwatch/tree/346b25914b0418342ffe2fb0529bed702fddc01f) and has since added many features; see the [comparison](https://webchanges.readthedocs.io/en/stable/upgrading.html).

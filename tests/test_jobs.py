@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import email.utils
 import ftplib
 import importlib.util
 import logging
 import os
 import socket
+import ssl
+import struct
 import subprocess
 import sys
-from contextlib import nullcontext
+import threading
+import traceback
+from contextlib import ExitStack, nullcontext
+from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
 
 import pytest
@@ -24,13 +32,23 @@ from webchanges.handler import JobState, Snapshot
 from webchanges.jobs import (
     BrowserJob,
     BrowserResponseError,
+    Job,
     JobBase,
     NotModifiedError,
     ShellJob,
     TransientHTTPError,
     UrlJob,
 )
+from webchanges.jobs._base import DEPRECATED_DIRECTIVES, replace_deprecated_directives
+from webchanges.jobs._browser import _proxy_settings
+from webchanges.jobs._exceptions import EMPTY_RESPONSE_STATUS_CODE
 from webchanges.jobs._shell import _add_python_verbosity, _logger_verbosity
+from webchanges.jobs._url import (
+    RETRY_AFTER_MAX,
+    RETRY_BACKOFF_MAX,
+    retry_after_seconds,
+    weak_dh_requests_adapter,
+)
 from webchanges.main import Urlwatch
 from webchanges.storage import SsdbSQLite3Storage, YamlConfigStorage, YamlJobsStorage, _Config
 
@@ -46,7 +64,14 @@ if playwright_is_installed:
 else:
     PlaywrightTimeoutError = Exception
 
-curl_cffi_is_installed = importlib.util.find_spec('curl_cffi') is not None
+# Checks that curl_cffi actually imports, not just that it is installed: on Windows free-threaded Python 3.15t its
+# compiled extension fails to load ('DLL load failed while importing _wrapper'), which webchanges handles like a
+# missing package.
+try:
+    importlib.import_module('curl_cffi.requests')
+    curl_cffi_is_installed = True
+except ImportError:
+    curl_cffi_is_installed = False
 
 here = Path(__file__).parent
 data_path = here.joinpath('data')
@@ -71,7 +96,7 @@ connection_required = cast(
 py_latest_only = cast(
     'Callable[[Callable], Callable]',
     pytest.mark.skipif(
-        sys.version_info < (3, 14),
+        sys.version_info < (3, 15),
         reason='Latest python only (time consuming)',
     ),
 )
@@ -308,10 +333,10 @@ def test_check_429_transient_error_curl_cffi(
     assert job_state.new_data == job_state.old_data
 
 
-def test_empty_as_transient(ssdb_storage: SsdbSQLite3Storage, mocker: pytest_mock.MockerFixture) -> None:
-    """Check that with empty_as_transient an empty response raises a TransientHTTPError (status code 999) and the
+def test_empty_as_error(ssdb_storage: SsdbSQLite3Storage, mocker: pytest_mock.MockerFixture) -> None:
+    """Check that with empty_as_error an empty response raises a TransientHTTPError (status code 999) and the
     last non-empty snapshot is preserved, so a later restoration of the same content shows as unchanged."""
-    job = JobBase.unserialize({'url': 'https://www.example.com/', 'empty_as_transient': True})
+    job = JobBase.unserialize({'url': 'https://www.example.com/', 'empty_as_error': True})
 
     # Create a mock response object returning valid content
     mock_response = mocker.Mock()
@@ -330,13 +355,13 @@ def test_empty_as_transient(ssdb_storage: SsdbSQLite3Storage, mocker: pytest_moc
         job_state.save()
         ssdb_storage._copy_temp_to_permanent(delete=True)
 
-    # Second run: the empty response is treated as a transient error and the old data is preserved
+    # Second run: the empty response is treated as an error and the old data is preserved
     mock_response.text = ''
     with JobState(ssdb_storage, job) as job_state:
         job_state.process()
         assert isinstance(job_state.exception, TransientHTTPError)
         assert job_state.exception.status_code == 999
-        assert 'empty_as_transient' in str(job_state.exception)
+        assert 'empty_as_error' in str(job_state.exception)
         assert job_state.error_ignored is False
         assert job_state.old_data == 'value: 1'
         job_state.save()  # on error, save() retains the old data in the snapshot
@@ -350,11 +375,11 @@ def test_empty_as_transient(ssdb_storage: SsdbSQLite3Storage, mocker: pytest_moc
         assert job_state.new_data == job_state.old_data == 'value: 1'
 
 
-def test_empty_as_transient_error_ignored(ssdb_storage: SsdbSQLite3Storage, mocker: pytest_mock.MockerFixture) -> None:
-    """Check that the transient error raised by empty_as_transient (status code 999) can be silenced with
+def test_empty_as_error_error_ignored(ssdb_storage: SsdbSQLite3Storage, mocker: pytest_mock.MockerFixture) -> None:
+    """Check that the error raised by empty_as_error (status code 999) can be silenced with
     ignore_http_error_codes."""
     job = JobBase.unserialize(
-        {'url': 'https://www.example.com/', 'empty_as_transient': True, 'ignore_http_error_codes': 999}
+        {'url': 'https://www.example.com/', 'empty_as_error': True, 'ignore_http_error_codes': 999}
     )
 
     mock_response = mocker.Mock()
@@ -371,10 +396,54 @@ def test_empty_as_transient_error_ignored(ssdb_storage: SsdbSQLite3Storage, mock
         assert job_state.error_ignored is True
 
 
-def test_empty_response_without_empty_as_transient(
+def test_empty_as_error_not_ignored_by_ignore_connection_errors(
     ssdb_storage: SsdbSQLite3Storage, mocker: pytest_mock.MockerFixture
 ) -> None:
-    """Check that without empty_as_transient an empty response is accepted as valid (empty) content."""
+    """Check that ignore_connection_errors does not silence the error raised by empty_as_error: the server did
+    respond, so an empty response is not a connection problem."""
+    job = JobBase.unserialize(
+        {'url': 'https://www.example.com/', 'empty_as_error': True, 'ignore_connection_errors': True}
+    )
+
+    mock_response = mocker.Mock()
+    mock_response.status_code = 200
+    mock_response.url = 'https://www.example.com/'
+    mock_response.history = []
+    mock_response.headers = {'Content-Type': 'text/plain'}
+    mock_response.text = ''
+    mocker.patch('httpx.Client.request', return_value=mock_response)
+
+    with JobState(ssdb_storage, job) as job_state:
+        job_state.process()
+        assert isinstance(job_state.exception, TransientHTTPError)
+        assert job_state.error_ignored is False
+
+    # ...while a genuine transient HTTP error still is silenced by it.
+    assert job.ignore_error(TransientHTTPError('503 Server Error', status_code=503)) is True
+
+
+def test_empty_as_error_whitespace_only(ssdb_storage: SsdbSQLite3Storage, mocker: pytest_mock.MockerFixture) -> None:
+    """Check that a whitespace-only response counts as empty."""
+    job = JobBase.unserialize({'url': 'https://www.example.com/', 'empty_as_error': True})
+
+    mock_response = mocker.Mock()
+    mock_response.status_code = 200
+    mock_response.url = 'https://www.example.com/'
+    mock_response.history = []
+    mock_response.headers = {'Content-Type': 'text/plain'}
+    mock_response.text = '   \n\n  '
+    mocker.patch('httpx.Client.request', return_value=mock_response)
+
+    with JobState(ssdb_storage, job) as job_state:
+        job_state.process()
+        assert isinstance(job_state.exception, TransientHTTPError)
+        assert job_state.exception.status_code == 999
+
+
+def test_empty_response_without_empty_as_error(
+    ssdb_storage: SsdbSQLite3Storage, mocker: pytest_mock.MockerFixture
+) -> None:
+    """Check that without empty_as_error an empty response is accepted as valid (empty) content."""
     job = JobBase.unserialize({'url': 'https://www.example.com/'})
 
     mock_response = mocker.Mock()
@@ -384,6 +453,151 @@ def test_empty_response_without_empty_as_transient(
     mock_response.headers = {'Content-Type': 'text/plain'}
     mock_response.text = ''
     mocker.patch('httpx.Client.request', return_value=mock_response)
+
+    with JobState(ssdb_storage, job) as job_state:
+        job_state.process()
+        assert job_state.exception is None
+        assert job_state.new_data == ''
+
+
+def test_empty_as_error_after_filtering(ssdb_storage: SsdbSQLite3Storage, mocker: pytest_mock.MockerFixture) -> None:
+    """Check that with empty_as_error a response that is not empty but from which the filters leave nothing (e.g. a
+    page that did not render fully) also raises a TransientHTTPError (status code 999) and the last non-empty
+    snapshot is preserved, so a later restoration of the same content shows as unchanged."""
+    job = JobBase.unserialize(
+        {'url': 'https://www.example.com/', 'empty_as_error': True, 'filters': [{'keep_lines_containing': 'value'}]}
+    )
+
+    mock_response = mocker.Mock()
+    mock_response.status_code = 200
+    mock_response.url = 'https://www.example.com/'
+    mock_response.history = []
+    mock_response.headers = {'Content-Type': 'text/plain'}
+    mock_response.text = 'header\nvalue: 1\nfooter'
+    mocker.patch('httpx.Client.request', return_value=mock_response)
+
+    # First run: the filtered content is saved as the snapshot
+    with JobState(ssdb_storage, job) as job_state:
+        job_state.process()
+        assert job_state.exception is None
+        assert job_state.new_data == 'value: 1'
+        job_state.save()
+        ssdb_storage._copy_temp_to_permanent(delete=True)
+
+    # Second run: the filters leave nothing, which is treated as an error and the old data is preserved
+    mock_response.text = 'header\nfooter'
+    with JobState(ssdb_storage, job) as job_state:
+        job_state.process()
+        assert isinstance(job_state.exception, TransientHTTPError)
+        assert job_state.exception.status_code == 999
+        assert 'after filtering' in str(job_state.exception)
+        assert job_state.error_ignored is False
+        assert job_state.old_data == 'value: 1'
+        job_state.save()  # on error, save() retains the old data in the snapshot
+        ssdb_storage._copy_temp_to_permanent(delete=True)
+
+    # Third run: the content is restored unchanged, so it matches the last non-empty snapshot (no change to report)
+    mock_response.text = 'header\nvalue: 1\nfooter'
+    with JobState(ssdb_storage, job) as job_state:
+        job_state.process()
+        assert job_state.exception is None
+        assert job_state.new_data == job_state.old_data == 'value: 1'
+
+
+def test_empty_as_error_ignore(ssdb_storage: SsdbSQLite3Storage, mocker: pytest_mock.MockerFixture) -> None:
+    """Check that with empty_as_error: ignore the error raised for an empty response, or for one from which the
+    filters leave nothing, is ignored (so it is neither reported nor counted towards max_tries) while other errors
+    are not."""
+    job = JobBase.unserialize(
+        {'url': 'https://www.example.com/', 'empty_as_error': 'ignore', 'filters': [{'keep_lines_containing': 'value'}]}
+    )
+
+    mock_response = mocker.Mock()
+    mock_response.status_code = 200
+    mock_response.url = 'https://www.example.com/'
+    mock_response.history = []
+    mock_response.headers = {'Content-Type': 'text/plain'}
+    mocker.patch('httpx.Client.request', return_value=mock_response)
+
+    for text in ('', 'header\nfooter'):
+        mock_response.text = text
+        with JobState(ssdb_storage, job) as job_state:
+            job_state.process()
+            assert isinstance(job_state.exception, TransientHTTPError)
+            assert job_state.exception.status_code == 999
+            assert job_state.error_ignored is True
+            assert job_state.tries == 0
+
+    mock_response.status_code = 503
+    mock_response.reason_phrase = 'Service Unavailable'
+    with JobState(ssdb_storage, job) as job_state:
+        job_state.process()
+        assert isinstance(job_state.exception, TransientHTTPError)
+        assert job_state.exception.status_code == 503
+        assert job_state.error_ignored is False
+
+
+def test_command_job_empty_as_error_ignore(ssdb_storage: SsdbSQLite3Storage) -> None:
+    """Check that empty_as_error: ignore also silences command jobs, which have no ignore_http_error_codes
+    directive."""
+    job = JobBase.unserialize({'command': f'"{sys.executable}" -c "pass"', 'empty_as_error': 'ignore'})
+
+    with JobState(ssdb_storage, job) as job_state:
+        job_state.process()
+        assert isinstance(job_state.exception, TransientHTTPError)
+        assert job_state.exception.status_code == 999
+        assert job_state.error_ignored is True
+
+
+def test_empty_as_error_invalid_value() -> None:
+    """Check that empty_as_error only accepts true, false and 'ignore'."""
+    with pytest.raises(ValueError, match='empty_as_error'):
+        JobBase.unserialize({'url': 'https://www.example.com/', 'empty_as_error': 'yes'})
+
+
+def test_command_job_empty_as_error(ssdb_storage: SsdbSQLite3Storage) -> None:
+    """Check that empty_as_error works in command jobs: no output raises a TransientHTTPError (status code 999) and
+    the last non-empty snapshot is preserved, so a later restoration of the same output shows as unchanged."""
+    print_job = JobBase.unserialize({'command': f'"{sys.executable}" -c "print(\'value: 1\')"', 'empty_as_error': True})
+    # Same guid (i.e. same snapshot) as print_job, but producing no output at all.
+    silent_job = JobBase.unserialize({'command': 'this is replaced below', 'empty_as_error': True})
+    silent_job.command = f'"{sys.executable}" -c "pass"'
+    silent_job.guid = print_job.guid
+    # ...and one producing whitespace only, which also counts as empty.
+    newline_job = JobBase.unserialize({'command': 'this is replaced below', 'empty_as_error': True})
+    newline_job.command = f'"{sys.executable}" -c "print()"'
+    newline_job.guid = print_job.guid
+
+    # First run: the output is saved as the snapshot
+    with JobState(ssdb_storage, print_job) as job_state:
+        job_state.process()
+        assert job_state.exception is None
+        assert job_state.new_data == 'value: 1\n'
+        job_state.save()
+        ssdb_storage._copy_temp_to_permanent(delete=True)
+
+    # Second and third runs: the empty output is treated as an error and the old data is preserved
+    for job in (silent_job, newline_job):
+        with JobState(ssdb_storage, job) as job_state:
+            job_state.process()
+            assert isinstance(job_state.exception, TransientHTTPError)
+            assert job_state.exception.status_code == 999
+            assert 'empty_as_error' in str(job_state.exception)
+            assert job_state.error_ignored is False  # command jobs have no ignore_http_error_codes directive
+            assert job_state.old_data == 'value: 1\n'
+            job_state.save()  # on error, save() retains the old data in the snapshot
+            ssdb_storage._copy_temp_to_permanent(delete=True)
+
+    # Fourth run: the output is restored unchanged, so it matches the last non-empty snapshot (no change to report)
+    with JobState(ssdb_storage, print_job) as job_state:
+        job_state.process()
+        assert job_state.exception is None
+        assert job_state.new_data == job_state.old_data == 'value: 1\n'
+
+
+def test_command_job_empty_output_without_empty_as_error(ssdb_storage: SsdbSQLite3Storage) -> None:
+    """Check that without empty_as_error a command producing no output is accepted as valid (empty) content."""
+    job = JobBase.unserialize({'command': f'"{sys.executable}" -c "pass"'})
 
     with JobState(ssdb_storage, job) as job_state:
         job_state.process()
@@ -847,6 +1061,26 @@ def test_check_bad_proxy(job_data: dict[str, Any], ssdb_storage: SsdbSQLite3Stor
             assert job_state.error_ignored is False
 
 
+@pytest.mark.parametrize(
+    ('proxy', 'expected'),
+    [
+        ('http://proxy.example.com:3128', {'server': 'http://proxy.example.com:3128'}),
+        ('https://proxy.example.com', {'server': 'https://proxy.example.com'}),
+        ('proxy.example.com:3128', {'server': 'http://proxy.example.com:3128'}),
+        ('http://[::1]:3128', {'server': 'http://[::1]:3128'}),
+        ('socks5://proxy.example.com:1080', {'server': 'socks5://proxy.example.com:1080'}),
+        (
+            'https://user:p%40ss@proxy.example.com:8080',
+            {'server': 'https://proxy.example.com:8080', 'username': 'user', 'password': 'p@ss'},
+        ),
+        ('http://user@proxy.example.com:8080', {'server': 'http://proxy.example.com:8080', 'username': 'user'}),
+    ],
+)
+def test_proxy_settings(proxy: str, expected: dict[str, str]) -> None:
+    """Credentials and port are passed to Playwright only if present in the proxy URL."""
+    assert _proxy_settings(proxy) == expected
+
+
 @connection_required
 @pytest.mark.parametrize(
     'job_data',
@@ -942,6 +1176,25 @@ def test_no_required_directive_plural() -> None:
     )
 
 
+def test_url_and_command_are_mutually_exclusive() -> None:
+    job_data = {'url': 'https://www.example.com', 'command': 'echo test'}
+    with pytest.raises(ValueError) as pytest_wrapped_e:
+        JobBase.unserialize(job_data)
+    assert str(pytest_wrapped_e.value) == (
+        f"Error in jobs file: Job directives 'url' and 'command' are mutually exclusive (a job monitors either a URL "
+        f'or the output of a command):\n{yaml.safe_dump(job_data)}'
+    )
+
+    # An explicit 'kind' does not make the combination acceptable.
+    job_data = {'kind': 'command', 'url': 'https://www.example.com', 'command': 'echo test'}
+    with pytest.raises(ValueError, match="'url' and 'command' are mutually exclusive"):
+        JobBase.unserialize(job_data)
+
+    # A falsy value in either directive is not a conflict (it fails the 'no job type' check instead).
+    with pytest.raises(ValueError, match="don't match a job type"):
+        JobBase.unserialize({'url': '', 'command': ''})
+
+
 def test_invalid_directive() -> None:
     job_data = {'url': 'https://www.example.com', 'directive_with_typo': 'this directive does not exist'}
     with pytest.raises(ValueError) as pytest_wrapped_e:
@@ -958,11 +1211,79 @@ def test_invalid_directive() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    'job_data',
+    [
+        {'url': 'https://www.example.com/'},
+        {'url': 'https://www.example.com/', 'use_browser': True},
+        {'command': 'echo test'},
+        None,  # a plain Job, i.e. what a job class defined in hooks.py inherits from
+    ],
+    ids=['url', 'browser', 'command', 'base'],
+)
+def test_format_error_transient_http_error_has_no_traceback(job_data: dict[str, Any] | None) -> None:
+    """A TransientHTTPError describes a condition of the monitored resource, not a webchanges failure, so reports
+    show its message rather than a full Python traceback."""
+    job = JobBase.unserialize(job_data) if job_data else Job()
+
+    for exception in (
+        TransientHTTPError('503 Server Error: Service Unavailable for url: https://www.example.com/', status_code=503),
+        TransientHTTPError('No data received and empty_as_error is set', status_code=999),
+    ):
+        try:
+            raise exception
+        except TransientHTTPError as e:
+            formatted = job.format_error(e, traceback.format_exc())
+        assert formatted == str(exception)
+        assert 'Traceback (most recent call last)' not in formatted
+
+
+def test_format_error_other_exception_keeps_traceback() -> None:
+    """Exceptions that are not recognized still fall back to the full traceback, which aids debugging."""
+    for job_data in ({'url': 'https://www.example.com/'}, {'command': 'echo test'}):
+        job = JobBase.unserialize(job_data)
+        try:
+            raise RuntimeError('something unexpected')
+        except RuntimeError as e:
+            formatted = job.format_error(e, traceback.format_exc())
+        assert formatted.startswith('Traceback (most recent call last)')
+        assert 'RuntimeError: something unexpected' in formatted
+
+
+def test_job_defaults_dict_does_not_leak_between_jobs() -> None:
+    """Applying a dict-valued job_default (e.g. headers) must not leak into other jobs.
+
+    A job that doesn't set the directive itself reads the class attribute (``JobBase.headers`` is a shared, mutable
+    ``Headers`` object), so ``_set_defaults`` must merge into a copy rather than in place.
+    """
+    config = cast('_Config', {'job_defaults': {'url_jobs': {'headers': {'X-Test': 'from-job-defaults'}}}})
+
+    url_job = JobBase.unserialize({'url': 'https://www.example.com/'})
+    job_with_defaults = url_job.with_defaults(config)
+    assert job_with_defaults.headers['X-Test'] == 'from-job-defaults'  # the default did get applied...
+
+    # ...but only to that job: not to the class attribute, nor to any other job (of any kind).
+    assert 'X-Test' not in JobBase.headers
+    assert 'X-Test' not in url_job.headers
+    assert 'X-Test' not in JobBase.unserialize({'url': 'https://www.example.org/'}).headers
+
+    command_job = JobBase.unserialize({'command': 'echo test'})
+    assert 'X-Test' not in command_job.headers
+    assert command_job.serialize() == {'command': 'echo test'}
+
+
 def test_validate_wrong_type_bool() -> None:
     job_data = {'url': 'https://www.example.com', 'enabled': 'yes'}
     with pytest.raises(ValueError) as pytest_wrapped_e:
         JobBase.unserialize(job_data)
     assert str(pytest_wrapped_e.value).startswith("Error in directive 'enabled' of job")
+
+
+def test_validate_wrong_type_markdown_extras() -> None:
+    """markdown_extras takes a dict of markdown2 extras, not a list of their names."""
+    job_data = {'url': 'https://www.example.com', 'markdown_extras': ['tables']}
+    with pytest.raises(ValueError, match="Error in directive 'markdown_extras'"):
+        JobBase.unserialize(job_data)
 
 
 def test_validate_wrong_type_numeric() -> None:
@@ -1003,11 +1324,46 @@ def test_validate_accepts_none_for_nullable() -> None:
 def test_navigate_directive() -> None:
     job_data = {'navigate': 'http://www.example.com'}
     with pytest.deprecated_call() as pytest_wrapped_warning:
-        JobBase.unserialize(job_data.copy())
+        job = JobBase.unserialize(job_data.copy())
     assert str(pytest_wrapped_warning.list[0].message) == (
         f"Error in jobs file: Job directive 'navigate' is deprecated: replace with 'url' and add 'use_browser: true':\n"
         f'{yaml.safe_dump(job_data)}'
     )
+    # Translated, not kept: until 3.39 the job failed when run ("Directive 'navigate' is deprecated with Playwright")
+    assert isinstance(job, BrowserJob)
+    assert job.navigate is None
+    assert job.serialize() == {'url': 'http://www.example.com', 'use_browser': True}
+
+
+@pytest.mark.filterwarnings('ignore::DeprecationWarning')  # of 'navigate'
+@pytest.mark.parametrize(
+    ('directives', 'use_browser', 'user_agent'),
+    [
+        ({'useragent': 'UA/1', 'browser': 'firefox'}, 'firefox', 'UA/1'),
+        ({'browser': 'chromium'}, True, None),
+        ({'useragent': 'UA/1', 'headers': {'user-agent': 'mine'}}, True, 'mine'),  # an explicit header wins
+        ({'wait_for': 'div.content'}, True, None),
+    ],
+)
+def test_urlwatch_browser_directives(
+    directives: dict[str, Any], use_browser: str | bool, user_agent: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """urlwatch's 'useragent', 'browser' and 'wait_for' directives of 'navigate' jobs are translated to a
+    'User-Agent' header, 'use_browser' and 'wait_for_selector', with a deprecation warning (until 3.39 they were
+    rejected as unrecognized, and 'wait_for' failed the job)."""
+    job = cast('BrowserJob', JobBase.unserialize({'navigate': 'https://example.com/', **directives}))
+    assert job.use_browser == use_browser
+    assert (job.headers or {}).get('User-Agent') == user_agent
+    assert job.wait_for is None
+    assert job.wait_for_selector == directives.get('wait_for')
+    assert 'is deprecated' in caplog.text
+
+
+def test_urlwatch_browser_directive_url_job() -> None:
+    """urlwatch's 'browser' directive does not turn a 'url' job into a browser job."""
+    job = JobBase.unserialize({'url': 'https://example.com/', 'browser': 'firefox'})
+    assert isinstance(job, UrlJob)
+    assert not job.use_browser
 
 
 # def test_kind_directive_deprecation() -> None:
@@ -1017,6 +1373,84 @@ def test_navigate_directive() -> None:
 #     assert str(pytest_wrapped_warning.list[0].message) == (
 #         f"Job directive 'kind' is deprecated and ignored: delete from job ({job_data})"
 #     )
+
+
+@pytest.mark.parametrize(('old', 'new'), DEPRECATED_DIRECTIVES.items())
+def test_replace_deprecated_directives(old: str, new: str) -> None:
+    directives = {'url': 'https://www.example.com', old: 'value'}
+    replace_deprecated_directives(directives)
+    assert directives == {'url': 'https://www.example.com', new: 'value'}
+
+
+def test_replace_deprecated_directives_https_proxy_wins_over_http_proxy() -> None:
+    directives = {'url': 'https://www.example.com', 'http_proxy': 'http://proxy', 'https_proxy': 'https://proxy'}
+    replace_deprecated_directives(directives)
+    assert directives == {'url': 'https://www.example.com', 'proxy': 'https://proxy'}
+
+
+def test_replace_deprecated_directives_leaves_current_ones_alone() -> None:
+    directives = {'url': 'https://www.example.com', 'filters': 'html2text', 'proxy': 'https://proxy'}
+    replace_deprecated_directives(directives)
+    assert directives == {'url': 'https://www.example.com', 'filters': 'html2text', 'proxy': 'https://proxy'}
+
+
+def test_deprecated_filter_directive_in_job() -> None:
+    job = JobBase.unserialize({'url': 'https://www.example.com', 'filter': 'html2text'})
+    assert job.filters == 'html2text'
+    assert not hasattr(job, 'filter')
+
+
+@pytest.mark.parametrize(
+    ('old', 'new', 'value'),
+    [
+        ('filter', 'filters', 'html2text'),
+        ('diff_filter', 'diff_filters', 'html2text'),
+        ('https_proxy', 'proxy', 'https://proxy'),
+        ('http_proxy', 'proxy', 'http://proxy'),
+        ('json', 'data_as_json', True),
+    ],
+)
+def test_from_dict_accepts_deprecated_directives(old: str, new: str, value: str | bool) -> None:
+    """Deprecated directives must survive from_dict()'s unrecognized-directive check."""
+    job = JobBase.unserialize({'url': 'https://www.example.com', old: value})
+    assert getattr(job, new) == value
+
+
+@pytest.mark.parametrize(
+    ('tags', 'expected'),
+    [
+        (None, set()),
+        ('personal', {'personal'}),
+        (['personal'], {'personal'}),
+        (['personal', 'team'], {'personal', 'team'}),
+    ],
+)
+def test_tags_set(tags: str | list[str] | None, expected: set[str]) -> None:
+    """The 'tags' job directive accepts either a single tag or a list of them."""
+    job = JobBase.unserialize({'url': 'https://www.example.com', 'tags': tags})
+    assert job.tags_set() == expected
+
+
+@pytest.mark.parametrize(
+    ('tags', 'select', 'expected'),
+    [
+        (None, ['personal'], set()),
+        ('personal', ['personal'], {'personal'}),
+        ('personal', ['team'], set()),
+        (['personal', 'team'], ['team', 'ops'], {'team'}),
+        (['personal', 'team'], [], set()),
+    ],
+)
+def test_matching_tags(tags: str | list[str] | None, select: list[str], expected: set[str]) -> None:
+    job = JobBase.unserialize({'url': 'https://www.example.com', 'tags': tags})
+    assert job.matching_tags(select) == expected
+
+
+def test_tags_directive_is_serialized() -> None:
+    """'tags' survives a serialize()/unserialize() round trip (i.e. it is in __optional__)."""
+    job = JobBase.unserialize({'url': 'https://www.example.com', 'tags': ['personal', 'team']})
+    assert job.serialize()['tags'] == ['personal', 'team']
+    job.validate()
 
 
 def test_url_job_without_kind() -> None:
@@ -1074,23 +1508,23 @@ def test_unserialize_leaves_input_dict_unmodified() -> None:
 def test_with_defaults() -> None:
     job_data = {'url': 'https://www.example.com'}
     job = JobBase.unserialize(job_data)
-    config: _Config = {'job_defaults': {'all': {'timeout': 999}}}  # ty:ignore[missing-typed-dict-key]
+    config: _Config = {'job_defaults': {'all_jobs': {'timeout': 999}}}  # ty:ignore[missing-typed-dict-key]
     job = job.with_defaults(config)
     assert job.timeout == 999
     assert job.get_indexed_location() == 'Job 0: https://www.example.com'
 
 
 def test_with_defaults_headers() -> None:
-    """Tests that the default headers are overwritten correctly: those more specific (i.e. ``url`` and ``browser``)
-    override those more generic (i.e. ``all``).
+    """Tests that the default headers are overwritten correctly: those more specific (i.e. ``url_jobs`` and
+    ``browser_jobs``) override those more generic (i.e. ``all_jobs``).
     """
     job_data = {'url': 'https://www.example.com'}
     job = JobBase.unserialize(job_data)
     config: _Config = {  # ty:ignore[missing-typed-dict-key]
         'job_defaults': {
-            'all': {'headers': {'a': '1', 'b': '2'}},
-            'url': {'headers': {'b': '3', 'c': '4'}},
-            'browser': {'headers': {'c': '5', 'd': '6'}},
+            'all_jobs': {'headers': {'a': '1', 'b': '2'}},
+            'url_jobs': {'headers': {'b': '3', 'c': '4'}},
+            'browser_jobs': {'headers': {'c': '5', 'd': '6'}},
         }
     }
     job = job.with_defaults(config)
@@ -1098,10 +1532,85 @@ def test_with_defaults_headers() -> None:
     assert job.get_indexed_location() == 'Job 0: https://www.example.com'
 
 
+def test_with_defaults_headers_job_wins_case_insensitively() -> None:
+    """The example in docs/configuration.rst: the job's headers win over url_jobs ones, which win over all_jobs ones,
+    header by header and case-insensitively."""
+    job = JobBase.unserialize({'url': 'https://www.example.com', 'headers': {'user-agent': 'Lynx'}})
+    config: _Config = {  # ty:ignore[missing-typed-dict-key]
+        'job_defaults': {
+            'all_jobs': {'headers': {'Accept-Language': 'en-US,en;q=0.9', 'User-Agent': 'Mozilla/5.0'}},
+            'url_jobs': {'headers': {'DNT': '1', 'User-Agent': 'Chrome'}},
+        }
+    }
+    job = job.with_defaults(config)
+    assert dict(job.headers) == {'user-agent': 'Lynx', 'dnt': '1', 'accept-language': 'en-US,en;q=0.9'}
+
+
+def test_with_defaults_headers_null_removes_default() -> None:
+    """A job's header set to null stops the job_defaults from supplying it, is not sent, and is saved back as null."""
+    job = JobBase.unserialize({'url': 'https://www.example.com', 'headers': {'user-agent': None, 'DNT': None}})
+    config: _Config = {  # ty:ignore[missing-typed-dict-key]
+        'job_defaults': {
+            'all_jobs': {'headers': {'Accept-Language': 'en-US', 'User-Agent': 'Mozilla/5.0'}},
+            'url_jobs': {'headers': {'DNT': '1'}},
+        }
+    }
+    job_with_defaults = cast('UrlJob', job.with_defaults(config))
+    job_state = cast('JobState', SimpleNamespace(tries=0, old_etag='', old_timestamp=None))
+    headers = job_with_defaults.get_headers(job_state, user_agent='webchanges-test')
+    assert dict(headers) == {'accept-language': 'en-US', 'user-agent': 'webchanges-test'}
+    assert job.to_dict()['headers'] == {'user-agent': None, 'dnt': None}
+
+
+def test_with_defaults_cookies_null_removes_default() -> None:
+    """A job's cookie set to null stops the job_defaults from supplying it, is not sent, and is saved back as null."""
+    job = JobBase.unserialize({'url': 'https://www.example.com', 'cookies': {'session': None, 'theme': 'dark'}})
+    config: _Config = {  # ty:ignore[missing-typed-dict-key]
+        'job_defaults': {
+            'all_jobs': {'cookies': {'consent': 'yes', 'session': 'abc'}},
+            'url_jobs': {'cookies': {'theme': 'light'}},
+        }
+    }
+    job_with_defaults = cast('UrlJob', job.with_defaults(config))
+    assert job_with_defaults.get_cookies() == {'theme': 'dark', 'consent': 'yes'}
+    job_state = cast('JobState', SimpleNamespace(tries=0, old_etag='', old_timestamp=None))
+    assert job_with_defaults.get_headers(job_state)['Cookie'] == 'theme=dark; consent=yes'
+    assert job.to_dict()['cookies'] == {'session': None, 'theme': 'dark'}
+    only_removed = JobBase.unserialize({'url': 'https://www.example.com', 'cookies': {'session': None}})
+    assert cast('UrlJob', only_removed).get_cookies() is None
+
+
 def test_ignore_error() -> None:
     job_data = {'url': 'https://www.example.com'}
     job = JobBase.unserialize(job_data)
     assert job.ignore_error(Exception()) is False
+
+
+def test_ignore_incomplete_reads() -> None:
+    """ignore_incomplete_reads silences the incomplete-read error of each HTTP client, and only that error."""
+    import httpx
+    import requests
+
+    incomplete_reads: list[Exception] = [
+        httpx.RemoteProtocolError(
+            'peer closed connection without sending complete message body: incomplete chunked read'
+        ),
+        requests.exceptions.ChunkedEncodingError('Connection broken: IncompleteRead(0 bytes read)'),
+    ]
+    if curl_cffi_is_installed:
+        from curl_cffi.requests import exceptions as curl_cffi_exceptions
+
+        incomplete_reads.extend(
+            [curl_cffi_exceptions.ChunkedEncodingError('chunked'), curl_cffi_exceptions.IncompleteRead('partial')]
+        )
+
+    job = JobBase.unserialize({'url': 'https://www.example.com', 'ignore_incomplete_reads': True})
+    assert all(job.ignore_error(exception) for exception in incomplete_reads)
+    assert job.ignore_error(httpx.ConnectError('Connection refused')) is False
+    assert job.ignore_error(requests.exceptions.ConnectionError('Connection refused')) is False
+
+    job = JobBase.unserialize({'url': 'https://www.example.com'})
+    assert not any(job.ignore_error(exception) for exception in incomplete_reads)
 
 
 def test_browser_switches_not_str_or_list() -> None:
@@ -1144,6 +1653,14 @@ def test_browser_connect_over_cdp_wrong_type() -> None:
     }
     with pytest.raises(ValueError, match="Error in directive 'connect_over_cdp'"):
         JobBase.unserialize(job_data)
+
+
+def test_browser_job_empty_as_error_accepted() -> None:
+    """``empty_as_error`` is accepted by ``JobBase.unserialize`` for browser jobs (extended in 3.38)."""
+    job_data = {'url': 'https://www.example.com', 'use_browser': True, 'empty_as_error': True}
+    job = JobBase.unserialize(job_data)
+    assert isinstance(job, BrowserJob)
+    assert job.empty_as_error is True
 
 
 # --- CDP cache teardown (connect_over_cdp) ------------------------------------
@@ -1310,6 +1827,153 @@ def test_acquire_cdp_browser_caches_and_releases(reset_cdp_cache: None, monkeypa
     assert _browser._cdp_cache.browsers == {}
 
 
+# --- empty_as_error for browser jobs -------------------------------------------
+# These tests fake the Playwright objects (via a patched _acquire_cdp_browser), so no real browser is needed;
+# playwright and psutil must still be importable because BrowserJob.retrieve() imports them up front.
+
+
+class _FakeBrowserResponse:
+    """Minimal fake of a Playwright Response."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+        self.status = 200
+        self.ok = True
+
+    def body(self) -> bytes:
+        return self._body
+
+    def header_value(self, name: str) -> str | None:
+        return None
+
+
+class _FakeBrowserPage:
+    """Minimal fake of a Playwright Page."""
+
+    # even for a zero-byte response, a real browser synthesizes a document skeleton
+    dom_skeleton = '<html><head></head><body></body></html>'
+
+    def __init__(self, response: _FakeBrowserResponse) -> None:
+        self._response = response
+
+    def goto(self, url: str, wait_until: str | None = None, referer: str | None = None) -> _FakeBrowserResponse:
+        return self._response
+
+    def content(self) -> str:
+        return self.dom_skeleton
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeBrowserContext:
+    """Minimal fake of a Playwright BrowserContext."""
+
+    def __init__(self, page: _FakeBrowserPage) -> None:
+        self._page = page
+        self.pages: list[Any] = []
+
+    def set_default_timeout(self, timeout: float) -> None:
+        pass
+
+    def new_page(self) -> _FakeBrowserPage:
+        return self._page
+
+
+class _FakeCdpBrowser:
+    """Minimal fake of a Playwright Browser attached over CDP."""
+
+    class _FakeBrowserType:
+        name = 'chromium'
+
+    browser_type = _FakeBrowserType()
+    version = '999.0'
+
+    def __init__(self, context: _FakeBrowserContext) -> None:
+        self.contexts = [context]
+
+
+def _make_faked_browser_job(monkeypatch: pytest.MonkeyPatch, body: bytes, job_extra: dict[str, Any]) -> BrowserJob:
+    """Build a connect_over_cdp BrowserJob whose navigation returns a fake response with the given raw body."""
+    from webchanges.jobs import _browser
+
+    browser = _FakeCdpBrowser(_FakeBrowserContext(_FakeBrowserPage(_FakeBrowserResponse(body))))
+
+    def fake_acquire(cdp_url: str, stack: ExitStack, sync_playwright_fn: Callable[[], Any]) -> tuple[Any, Any, bool]:
+        return None, browser, False
+
+    monkeypatch.setattr(_browser, '_acquire_cdp_browser', fake_acquire)
+    job = JobBase.unserialize(
+        {'url': 'https://www.example.com/', 'use_browser': True, 'connect_over_cdp': True} | job_extra
+    )
+    assert isinstance(job, BrowserJob)
+    return job
+
+
+@playwright_required
+@pytest.mark.parametrize('body', [b'', b'  \n\n '], ids=['zero-byte', 'whitespace-only'])
+def test_browser_empty_as_error_empty_body(
+    ssdb_storage: SsdbSQLite3Storage, monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    """With empty_as_error, an empty document raises a TransientHTTPError with the synthetic status 999."""
+    job = _make_faked_browser_job(monkeypatch, body, {'empty_as_error': True})
+    with JobState(ssdb_storage, job) as job_state, pytest.raises(TransientHTTPError) as exc_info:
+        job.retrieve(job_state)
+    assert exc_info.value.status_code == 999
+    assert 'empty_as_error' in str(exc_info.value)
+
+
+@playwright_required
+def test_browser_empty_as_error_nonempty_body(
+    ssdb_storage: SsdbSQLite3Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With empty_as_error, a non-empty document is retrieved normally."""
+    job = _make_faked_browser_job(monkeypatch, b'<html><body>value: 1</body></html>', {'empty_as_error': True})
+    with JobState(ssdb_storage, job) as job_state:
+        data, etag, _mime_type = job.retrieve(job_state)
+    assert data == _FakeBrowserPage.dom_skeleton
+    assert etag == ''
+
+
+@playwright_required
+def test_browser_empty_body_without_empty_as_error(
+    ssdb_storage: SsdbSQLite3Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without empty_as_error, a zero-byte document is retrieved as the (skeleton) rendered page."""
+    job = _make_faked_browser_job(monkeypatch, b'', {})
+    with JobState(ssdb_storage, job) as job_state:
+        data, _etag, _mime_type = job.retrieve(job_state)
+    assert data == _FakeBrowserPage.dom_skeleton
+
+
+@playwright_required
+def test_browser_ignore_error_transient_http_codes() -> None:
+    """In browser jobs, ignore_http_error_codes also silences TransientHTTPError (incl. the synthetic 999 raised
+    by empty_as_error), fixed in 3.38."""
+    job = JobBase.unserialize({'url': 'https://www.example.com/', 'use_browser': True, 'ignore_http_error_codes': 999})
+    assert job.ignore_error(TransientHTTPError('No data and empty_as_error is set', status_code=999)) is True
+    assert job.ignore_error(TransientHTTPError('Server Error', status_code=500)) is False
+
+
+@playwright_required
+def test_browser_ignore_connection_errors_does_not_silence_empty() -> None:
+    """In browser jobs, ignore_connection_errors silences genuine transient errors but not the synthetic 999 raised
+    by empty_as_error: the server did respond, so an empty response is not a connection problem."""
+    job = JobBase.unserialize(
+        {'url': 'https://www.example.com/', 'use_browser': True, 'ignore_connection_errors': True}
+    )
+    assert job.ignore_error(TransientHTTPError('No data and empty_as_error is set', status_code=999)) is False
+    assert job.ignore_error(TransientHTTPError('Server Error', status_code=503)) is True
+
+    job = JobBase.unserialize(
+        {'url': 'https://www.example.com/', 'use_browser': True, 'ignore_http_error_codes': '5xx'}
+    )
+    assert job.ignore_error(TransientHTTPError('Service Unavailable', status_code=503)) is True
+
+    job = JobBase.unserialize({'url': 'https://www.example.com/', 'use_browser': True})
+    assert job.ignore_error(TransientHTTPError('No data and empty_as_error is set', status_code=999)) is False
+
+
 # @playwright_required
 # def test_browser_block_elements_not_str_or_list():
 #     job_data = {
@@ -1450,6 +2114,58 @@ def test_shell_command_stdin_is_null_device(ssdb_storage: SsdbSQLite3Storage) ->
         job_state.process()
         assert isinstance(job_state.exception, subprocess.CalledProcessError)
         assert 'EOFError' in (job_state.exception.stderr or '')
+
+
+@pytest.mark.parametrize(
+    ('stderr', 'exit_code', 'data', 'error', 'forwarded'),
+    [
+        (None, 0, 'out\n', None, ''),
+        ('ignore', 0, 'out\n', None, ''),
+        ('ignore', 1, None, 'Error: Exit status 1 returned from subprocess:\nerr', ''),
+        ('forward', 0, 'out\n', None, 'err\n'),
+        ('forward', 1, None, 'Error: Exit status 1 returned from subprocess:\nerr', 'err\n'),
+        ('urlwatch', 0, 'out\n', None, 'err\n'),  # urlwatch's name for 'forward'
+        ('fail', 0, None, 'Error: Output on standard error (directive stderr: fail):\nerr', ''),
+        ('stdout', 0, 'out\nerr\n', None, ''),
+    ],
+)
+def test_shell_stderr_directive(
+    stderr: str | None,
+    exit_code: int,
+    data: str | None,
+    error: str | None,
+    forwarded: str,
+    ssdb_storage: SsdbSQLite3Storage,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The stderr directive of command jobs: 'ignore' (the default) reports stderr only in the error of a failed
+    command, 'forward' (urlwatch's 'urlwatch') also writes it to webchanges' stderr, 'fail' fails the job on any stderr
+    output, and 'stdout' merges it into the data (until 3.39, any value failed the job)."""
+    script = f"import sys; print('out', flush=True); print('err', file=sys.stderr, flush=True); sys.exit({exit_code})"
+    job_data: dict[str, Any] = {'command': f'"{sys.executable}" -c "{script}"'}
+    if stderr:
+        job_data['stderr'] = stderr
+    job = JobBase.unserialize(job_data)
+    with JobState(ssdb_storage, job) as job_state:
+        job_state.process()
+        if error is None:
+            assert job_state.exception is None
+            assert str(job_state.new_data).replace('\r\n', '\n') == data
+        else:
+            assert job_state.exception is not None
+            assert job.format_error(job_state.exception, '').replace('\r\n', '\n') == error
+    assert capsys.readouterr().err.replace('\r\n', '\n') == forwarded
+
+
+def test_shell_stderr_directive_invalid(ssdb_storage: SsdbSQLite3Storage) -> None:
+    """An unknown value of the stderr directive is an error naming the valid ones."""
+    job = JobBase.unserialize({'command': 'echo hi', 'stderr': 'nope'})
+    with JobState(ssdb_storage, job) as job_state:
+        job_state.process()
+        assert isinstance(job_state.exception, ValueError)
+        assert "Invalid value 'nope' for directive 'stderr'; must be one of ignore, forward, fail, stdout." in str(
+            job_state.exception
+        )
 
 
 def test_compared_versions(ssdb_storage: SsdbSQLite3Storage) -> None:
@@ -1607,3 +2323,370 @@ def test_job_states_verb_notimestamp_changed(time_jobs_urlwatcher: Urlwatch) -> 
     urlwatcher.run_jobs()
     urlwatcher.ssdb_storage._copy_temp_to_permanent(delete=True)
     assert urlwatcher.report.job_states[-1].verb == 'unchanged'
+
+
+# ---------------------------------------------------------------- retries directive
+
+
+class _FlakyHandler(BaseHTTPRequestHandler):
+    """Fails the first ``failures`` requests (by resetting the connection, or with the status code ``mode``), then
+    answers 200 'ok'."""
+
+    count = 0
+    failures = 1
+    mode = 'reset'
+    retry_after: str | None = None
+
+    def do_GET(self) -> None:
+        cls = type(self)
+        cls.count += 1
+        if cls.count <= cls.failures:
+            if cls.mode == 'reset':
+                # Close with RST instead of FIN
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+                self.connection.close()
+                return
+            self.send_response(int(cls.mode))
+            if cls.retry_after:
+                self.send_header('Retry-After', cls.retry_after)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        body = b'ok'
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        pass
+
+
+@pytest.fixture
+def flaky_server() -> Iterator[str]:
+    """A local HTTP server with a _FlakyHandler; yields its URL."""
+    _FlakyHandler.count, _FlakyHandler.failures, _FlakyHandler.mode, _FlakyHandler.retry_after = 0, 1, 'reset', None
+    server = ThreadingHTTPServer(('127.0.0.1', 0), _FlakyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f'http://127.0.0.1:{server.server_address[1]}/'
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+RETRY_CLIENTS = [
+    'httpx',
+    'requests',
+    pytest.param('curl_cffi', marks=pytest.mark.skipif(not curl_cffi_is_installed, reason='curl_cffi not installed')),
+]
+
+
+@pytest.mark.parametrize('client', RETRY_CLIENTS)
+@pytest.mark.parametrize(('mode', 'retry_after', 'expected_wait'), [('reset', None, 1), ('503', '7', 7)])
+def test_retries_transient_error(
+    flaky_server: str,
+    mocker: pytest_mock.MockerFixture,
+    client: str,
+    mode: str,
+    retry_after: str | None,
+    expected_wait: float,
+) -> None:
+    """With 'retries', a connection reset or a transient HTTP response is retried, after the server's Retry-After or
+    else the backoff (issue #196)."""
+    _FlakyHandler.mode, _FlakyHandler.retry_after = mode, retry_after
+    sleep = mocker.patch('webchanges.jobs._url.time.sleep')
+    job = JobBase.unserialize({'url': flaky_server, 'http_client': client, 'retries': 2, 'timeout': 5})
+    with JobState(None, job) as job_state:  # ty:ignore[invalid-argument-type]
+        data, _, _ = job.retrieve(job_state)
+    assert data == 'ok'
+    assert _FlakyHandler.count == 2
+    sleep.assert_called_once_with(expected_wait)
+
+
+@pytest.mark.parametrize('client', RETRY_CLIENTS)
+def test_retries_not_set_does_not_retry(flaky_server: str, client: str) -> None:
+    """Without 'retries', a failed request is not repeated."""
+    job = JobBase.unserialize({'url': flaky_server, 'http_client': client, 'timeout': 5})
+    with (
+        JobState(None, job) as job_state,  # ty:ignore[invalid-argument-type]
+        pytest.raises(Exception) as exc_info,
+    ):
+        job.retrieve(job_state)
+    assert UrlJob.is_transient_error(exc_info.value)
+    assert _FlakyHandler.count == 1
+
+
+def test_retries_exhausted(flaky_server: str, mocker: pytest_mock.MockerFixture) -> None:
+    """When every attempt fails, the error of the last one is raised after 1 + 'retries' attempts, with exponential
+    backoff between them."""
+    _FlakyHandler.mode, _FlakyHandler.failures = '503', 99
+    sleep = mocker.patch('webchanges.jobs._url.time.sleep')
+    job = JobBase.unserialize({'url': flaky_server, 'retries': 2, 'timeout': 5})
+    with (
+        JobState(None, job) as job_state,  # ty:ignore[invalid-argument-type]
+        pytest.raises(TransientHTTPError),
+    ):
+        job.retrieve(job_state)
+    assert _FlakyHandler.count == 3
+    assert [call.args[0] for call in sleep.call_args_list] == [1, 2]
+
+
+def test_retries_permanent_error_not_retried(flaky_server: str, mocker: pytest_mock.MockerFixture) -> None:
+    """An error that a new attempt cannot fix (e.g. HTTP 404) is not retried."""
+    _FlakyHandler.mode = '404'
+    sleep = mocker.patch('webchanges.jobs._url.time.sleep')
+    job = JobBase.unserialize({'url': flaky_server, 'retries': 2, 'timeout': 5})
+    with (
+        JobState(None, job) as job_state,  # ty:ignore[invalid-argument-type]
+        pytest.raises(HTTPStatusError),
+    ):
+        job.retrieve(job_state)
+    assert _FlakyHandler.count == 1
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('value', 'expected'),
+    [(None, None), ('', None), ('5', 5.0), ('-3', 0.0), ('not a date', None), ('Wed, 21 Oct 2015 07:28:00 GMT', 0.0)],
+)
+def test_retry_after_seconds(value: str | None, expected: float | None) -> None:
+    """A Retry-After header is read as seconds or as an HTTP date (a past one meaning no wait)."""
+    assert retry_after_seconds(value) == expected
+
+
+def test_retry_after_seconds_future_date() -> None:
+    """A Retry-After HTTP date in the future is the number of seconds until then."""
+    value = email.utils.format_datetime(datetime.now(UTC) + timedelta(seconds=100), usegmt=True)
+    seconds = retry_after_seconds(value)
+    assert seconds is not None
+    assert 95 < seconds <= 100
+
+
+def test_retry_wait_caps() -> None:
+    """The backoff and the server's Retry-After are both capped, so a job can't stall a run."""
+    assert UrlJob.retry_wait(ValueError(), 1) == 1
+    assert UrlJob.retry_wait(ValueError(), 3) == 4
+    assert UrlJob.retry_wait(ValueError(), 20) == RETRY_BACKOFF_MAX
+    assert UrlJob.retry_wait(TransientHTTPError('', status_code=429, retry_after=3600), 1) == RETRY_AFTER_MAX
+    assert not UrlJob.is_transient_error(TransientHTTPError('', status_code=EMPTY_RESPONSE_STATUS_CODE))
+
+
+@pytest.mark.parametrize(('ssl_no_verify', 'verify_mode'), [(False, ssl.CERT_REQUIRED), (True, ssl.CERT_NONE)])
+def test_ignore_dh_key_too_small_httpx_context(
+    mocker: pytest_mock.MockerFixture, ssl_no_verify: bool, verify_mode: ssl.VerifyMode
+) -> None:
+    """With ignore_dh_key_too_small, httpx gets an SSL context that lowers the security level but still verifies
+    certificates against CA certificates (unless ssl_no_verify is set)."""
+    client = mocker.patch('webchanges.jobs._url.httpx.Client', side_effect=RuntimeError('stop'))
+    job = JobBase.unserialize(
+        {'url': 'https://www.example.com/', 'ignore_dh_key_too_small': True, 'ssl_no_verify': ssl_no_verify}
+    )
+    with (
+        JobState(None, job) as job_state,  # ty:ignore[invalid-argument-type]
+        pytest.raises(RuntimeError, match='stop'),
+    ):
+        job.retrieve(job_state)
+    context = client.call_args.kwargs['verify']
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == verify_mode
+    if not ssl_no_verify:
+        assert context.cert_store_stats()['x509_ca'] > 0
+
+
+@pytest.mark.parametrize(('verify', 'verify_mode'), [(True, ssl.CERT_REQUIRED), (False, ssl.CERT_NONE)])
+def test_weak_dh_requests_adapter(verify: bool, verify_mode: ssl.VerifyMode) -> None:
+    """The requests adapter of ignore_dh_key_too_small passes its SSL context to direct and proxied connections."""
+    adapter = weak_dh_requests_adapter(verify)
+    context = adapter.poolmanager.connection_pool_kw['ssl_context']
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == verify_mode
+    assert adapter.proxy_manager_for('http://proxy.example.com:3128').connection_pool_kw['ssl_context'] is context
+
+
+def test_ignore_dh_key_too_small_requests_mounts_adapter(mocker: pytest_mock.MockerFixture) -> None:
+    """With ignore_dh_key_too_small and http_client: requests, HTTPS requests go through the weak-DH adapter."""
+    import requests
+
+    adapters: list[str] = []
+
+    def capture(session: requests.Session, *args: Any, **kwargs: Any) -> None:
+        adapters.append(type(session.get_adapter('https://www.example.com/')).__name__)
+        raise RuntimeError('stop')
+
+    mocker.patch.object(requests.Session, 'request', autospec=True, side_effect=capture)
+    job = JobBase.unserialize(
+        {'url': 'https://www.example.com/', 'http_client': 'requests', 'ignore_dh_key_too_small': True}
+    )
+    with (
+        JobState(None, job) as job_state,  # ty:ignore[invalid-argument-type]
+        pytest.raises(RuntimeError, match='stop'),
+    ):
+        job.retrieve(job_state)
+    assert adapters == ['WeakDHAdapter']
+
+
+# ---------------------------------------------------------------- HTTP clients behave the same
+
+# UrlJob has one implementation per HTTP client (httpx, requests, curl_cffi), and the fallback chain between them means
+# a user can end up on any of them, so they must give the same data, ETag, media type and error messages.
+
+
+class _ScriptedHandler(BaseHTTPRequestHandler):
+    """Answers each path with the status, Content-Type, body and extra headers in ``ROUTES``; '/cookies' answers with
+    the Cookie request header received."""
+
+    ROUTES: dict[str, tuple[int, str | None, bytes, dict[str, str]]] = {
+        '/etag': (200, 'text/plain; charset=utf-8', b'hello', {'ETag': '"v1"'}),
+        '/no-charset': (200, 'text/plain', 'café crème brûlée naïve résumé façade'.encode(), {}),
+        '/redirect': (302, 'text/plain', b'moved', {'Location': '/etag'}),
+        '/redirect-html': (301, 'text/html', b'<p>moved</p>', {'Location': 'https://example.com/new'}),
+        '/redirect-json': (307, 'application/json', b'{}', {'Location': 'https://example.com/new'}),
+        '/redirect-other': (308, 'image/png', b'', {'Location': 'https://example.com/new'}),
+        '/not-modified': (304, None, b'', {}),
+        '/json-400': (400, 'application/json', b'{"error": "bad",\n "code": 7}', {}),
+        '/html-403': (
+            403,
+            'text/html',
+            b'<html><head><title>Forbidden</title></head><body><h1>Access denied</h1><p>Go away</p></body></html>',
+            {},
+        ),
+        '/text-404': (404, 'text/plain', b'not here', {}),
+        '/text-500': (500, 'text/plain', b'oops', {}),
+        '/text-503': (503, 'text/plain', b'try later', {'Retry-After': '30'}),
+    }
+
+    def do_GET(self) -> None:
+        if self.path == '/cookies':
+            status, content_type, body, extra = 200, 'text/plain', (self.headers.get('Cookie') or '').encode(), {}
+        else:
+            status, content_type, body, extra = self.ROUTES[self.path]
+        self.send_response(status)
+        if content_type:
+            self.send_header('Content-Type', content_type)
+        for key, value in extra.items():
+            self.send_header(key, value)
+        if status != 304:
+            self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if status != 304:
+            self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        pass
+
+
+@pytest.fixture(scope='module')
+def scripted_server() -> Iterator[str]:
+    """A local HTTP server with a _ScriptedHandler; yields its URL (without a trailing slash)."""
+    server = ThreadingHTTPServer(('127.0.0.1', 0), _ScriptedHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f'http://127.0.0.1:{server.server_address[1]}'
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _retrieve(url: str, client: str, **directives: Any) -> tuple[str | bytes, str, str]:
+    job = JobBase.unserialize({'url': url, 'http_client': client, 'timeout': 5, **directives})
+    with JobState(None, job) as job_state:  # ty:ignore[invalid-argument-type]
+        return job.retrieve(job_state)
+
+
+@pytest.mark.parametrize('client', RETRY_CLIENTS)
+@pytest.mark.parametrize(
+    ('path', 'directives', 'expected'),
+    [
+        pytest.param('/etag', {}, ('hello', '"v1"', 'text/plain'), id='etag'),
+        pytest.param('/no-charset', {}, ('café crème brûlée naïve résumé façade', '', 'text/plain'), id='no-charset'),
+        pytest.param('/redirect', {}, ('hello', '', 'text/plain'), id='followed-redirect-drops-etag'),
+        pytest.param(
+            '/redirect', {'no_redirects': True}, ('Redirect 302 Found to /etag:\nmoved', '', 'text/plain'), id='text'
+        ),
+        pytest.param(
+            '/redirect-html',
+            {'no_redirects': True},
+            (
+                (
+                    'Redirect <b>301 Moved Permanently</b> to <a href="https://example.com/new">'
+                    'https://example.com/new</a>:<br><p>moved</p>'
+                ),
+                '',
+                'text/html',
+            ),
+            id='html',
+        ),
+        pytest.param(
+            '/redirect-json',
+            {'no_redirects': True},
+            ('{"Redirect 307 Temporary Redirect":"https://example.com/new"}', '', 'application/json'),
+            id='json',
+        ),
+        pytest.param(
+            '/redirect-other',
+            {'no_redirects': True},
+            ('Redirect 308 Permanent Redirect to https://example.com/new.', '', 'image/png'),
+            id='other',
+        ),
+    ],
+)
+def test_http_clients_response(
+    scripted_server: str, client: str, path: str, directives: dict[str, Any], expected: tuple[str, str, str]
+) -> None:
+    """Every HTTP client returns the same data, ETag and media type, including for a redirect not followed (no_redirects
+    directive), whose data describes it according to its media type."""
+    assert _retrieve(scripted_server + path, client, **directives) == expected
+
+
+@pytest.mark.parametrize('client', RETRY_CLIENTS)
+@pytest.mark.parametrize(
+    ('path', 'transient', 'message', 'retry_after'),
+    [
+        pytest.param(
+            '/json-400',
+            False,
+            '400 Client Error: Bad Request for url: {url}\n{{"error":"bad","code":7}}',
+            None,
+            id='json',
+        ),
+        pytest.param(
+            '/html-403', False, '403 Client Error: Forbidden for url: {url}\n# Access denied\nGo away', None, id='html'
+        ),
+        pytest.param('/text-404', False, '404 Client Error: Not Found for url: {url}', None, id='404-no-body'),
+        pytest.param('/text-500', True, '500 Server Error: Internal Server Error for url: {url}\noops', None, id='500'),
+        pytest.param(
+            '/text-503', True, '503 Server Error: Service Unavailable for url: {url}\ntry later', 30.0, id='503'
+        ),
+    ],
+)
+def test_http_clients_error_response(
+    scripted_server: str, client: str, path: str, transient: bool, message: str, retry_after: float | None
+) -> None:
+    """Every HTTP client raises the same error message for an HTTP error, with the response body appended (except for a
+    404): JSON compacted, HTML converted to text without its title, else as is. 429 and 5xx errors are transient and
+    carry the server's Retry-After."""
+    url = scripted_server + path
+    with pytest.raises(Exception) as exc_info:
+        _retrieve(url, client)
+    assert str(exc_info.value) == message.format(url=url)
+    assert isinstance(exc_info.value, TransientHTTPError) is transient
+    if transient:
+        assert exc_info.value.retry_after == retry_after  # ty:ignore[unresolved-attribute]
+
+
+@pytest.mark.parametrize('client', RETRY_CLIENTS)
+def test_http_clients_not_modified(scripted_server: str, client: str) -> None:
+    """Every HTTP client raises NotModifiedError for an HTTP 304 response."""
+    with pytest.raises(NotModifiedError):
+        _retrieve(scripted_server + '/not-modified', client)
+
+
+@pytest.mark.parametrize('client', RETRY_CLIENTS)
+def test_http_clients_send_cookies(scripted_server: str, client: str) -> None:
+    """Every HTTP client sends the cookies of the 'cookies' directive, except those set to null."""
+    data, _, _ = _retrieve(scripted_server + '/cookies', client, cookies={'session': 'abc', 'tracking': None})
+    assert data == 'session=abc'

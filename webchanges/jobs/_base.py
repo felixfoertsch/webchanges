@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-import asyncio  # noqa: TC003 (required for type check)
+__lazy_modules__ = ['asyncio', 'copy', 'email.utils', 'hashlib', 'textwrap', 'urllib.parse', 'warnings']
+
 import copy
 import email.utils
 import hashlib
@@ -13,20 +14,24 @@ import os
 import re
 import textwrap
 import warnings
-from typing import TYPE_CHECKING, Any, Literal, get_type_hints
+from typing import TYPE_CHECKING, Any, Iterable, Literal, get_type_hints
 from urllib.parse import urlsplit
 
 import yaml
 
 from webchanges import __user_agent__
 from webchanges.filters._base import FiltersList  # noqa: TC001 (required for type check)
+from webchanges.jobs._exceptions import TransientHTTPError
 from webchanges.util import TrackSubClasses
 
+# The fallback assignment below is hidden from the type checker behind `if not TYPE_CHECKING` (see webchanges/jobs/
+# _url.py for the full explanation).
 try:
     import httpx
 except ImportError:  # pragma: no cover
     print("Required package 'httpx' not found; will attempt to run using 'requests'")
-    httpx = None  # ty:ignore[invalid-assignment]
+    if not TYPE_CHECKING:
+        httpx = None
 
 if httpx is not None:
     from httpx import Headers
@@ -34,7 +39,7 @@ if httpx is not None:
     try:
         import h2
     except ImportError:  # pragma: no cover
-        h2 = None  # ty:ignore[invalid-assignment]
+        h2 = None
 else:
     from webchanges._vendored.headers import Headers
 
@@ -52,10 +57,45 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The value standing for a header set to null, i.e. removed (a Headers object cannot hold None). It is kept while the
+# job_defaults are merged, so that it stops the less specific defaults from supplying that header, and is dropped by
+# get_headers() before the request is sent.
+REMOVED_HEADER = '\x00removed'
+
+
+def headers_from_dict(headers: dict[str, Any]) -> Headers:
+    """Convert headers read from YAML into a Headers object, with values as strings and null ones marked as removed.
+
+    :param headers: The headers, e.g. from the 'headers' directive of a job or job_defaults.
+    :returns: The Headers object.
+    """
+    return Headers({k: REMOVED_HEADER if v is None else str(v) for k, v in headers.items()}, encoding='utf-8')
+
+
+def headers_to_dict(headers: Headers) -> dict[str, str | None]:
+    """Convert a Headers object into a dict, restoring removed headers to None (the inverse of headers_from_dict).
+
+    :param headers: The Headers object.
+    :returns: The headers as a dict.
+    """
+    return {k: None if v == REMOVED_HEADER else v for k, v in headers.items()}
+
+
+def cookies_from_dict(cookies: dict[str, Any]) -> dict[str, str | None]:
+    """Convert cookies read from YAML into strings, keeping null ones (removed) as None.
+
+    As with headers, a None value is kept while the job_defaults are merged, so that it stops the less specific
+    defaults from supplying that cookie, and is dropped by get_cookies() before the request is sent.
+
+    :param cookies: The cookies, e.g. from the 'cookies' directive of a job or job_defaults.
+    :returns: The cookies.
+    """
+    return {k: None if v is None else str(v) for k, v in cookies.items()}
+
 
 # Custom YAML representer function for httpx.Headers
 def represent_headers(dumper: yaml.SafeDumper, data: Headers) -> yaml.MappingNode:
-    return dumper.represent_dict(dict(data))
+    return dumper.represent_dict(headers_to_dict(data))
 
 
 # Add the custom representer to the SafeDumper
@@ -65,6 +105,33 @@ yaml.SafeDumper.add_representer(Headers, represent_headers)
 if httpx is not None and logger.getEffectiveLevel() == logging.DEBUG:
     logging.getLogger('hpack').setLevel(logging.INFO)
     logging.getLogger('httpcore').setLevel(logging.INFO)
+
+# Deprecated job directives and the directive replacing each one. Insertion order matters: 'https_proxy' is
+# processed before 'http_proxy' so that, when both are present, 'https_proxy' wins (see below).
+DEPRECATED_DIRECTIVES: dict[str, str] = {
+    'filter': 'filters',
+    'diff_filter': 'diff_filters',
+    'https_proxy': 'proxy',
+    'http_proxy': 'proxy',
+    'json': 'data_as_json',
+}
+
+
+def replace_deprecated_directives(directives: dict[str, Any]) -> None:
+    """Renames any deprecated job directive to the directive replacing it, modifying the dict in place.
+
+    :param directives: The job's directives (e.g. as read from the YAML jobs file).
+    """
+    if 'https_proxy' in directives:
+        # Both legacy directives map onto 'proxy', which is scheme-agnostic; 'https_proxy' takes precedence.
+        directives.pop('http_proxy', None)
+
+    for old, new in DEPRECATED_DIRECTIVES.items():
+        if old in directives:
+            logger.warning(
+                "Job %s: Replacing deprecated directive '%s' with '%s'", directives.get('index_number'), old, new
+            )
+            directives[new] = directives.pop(old)
 
 
 class JobBase(metaclass=TrackSubClasses):
@@ -92,21 +159,22 @@ class JobBase(metaclass=TrackSubClasses):
     compared_versions: int | None = None
     contextlines: int | None = None
     connect_over_cdp: str | bool | None = None  # BrowserJob
-    cookies: dict[str, str] | None = None  # UrlJobBase
+    cookies: dict[str, str | None] | None = None  # UrlJobBase; a None value is a removed cookie, see get_cookies()
     data: str | list | dict | None = None  # UrlJobBase
     data_as_json: bool | None = None  # UrlJobBase
     deletions_only: bool | None = None
     differ: dict[str, Any] | None = None  # added in 3.21
     diff_filters: str | list[str | dict[str, Any]] | None = None
     diff_tool: str | None = None  # deprecated in 3.21
-    empty_as_transient: bool | None = None  # UrlJob
+    empty_as_error: bool | Literal['ignore'] | None = None
     enabled: bool | None = None
     encoding: str | None = None  # UrlJobBase
     evaluate: str | None = None  # BrowserJob
     filters: FiltersList | list[FiltersList | dict[str, Any]] | None = None
     fingerprints: dict[str, str | dict[str, Any]] | None = None  # UrlJob (curl_cffi backend only)
     guid: str = ''
-    headers = Headers(encoding='utf-8')  # UrlJobBase
+    headers = Headers(encoding='utf-8')  # UrlJobBase; shared by all jobs not setting it: never mutate it in place
+    hook_data: Any = None  # hooks.py
     http_client: Literal['httpx', 'requests', 'curl_cffi'] | None = None  # UrlJob
     http_version: Literal['v1', 'v2', 'v2tls', 'v2_prior_knowledge', 'v3', 'v3only'] | None = None  # UrlJob
     http_credentials: str | None = None  # BrowserJob
@@ -116,6 +184,7 @@ class JobBase(metaclass=TrackSubClasses):
     ignore_dh_key_too_small: bool | None = None  # UrlJob
     ignore_http_error_codes: list[int | str] | int | str | None = None  # UrlJobBase
     ignore_https_errors: bool | None = None  # BrowserJob
+    ignore_incomplete_reads: bool | None = None  # UrlJob
     ignore_timeout_errors: bool | None = None  # UrlJobBase
     ignore_too_many_redirects: bool | None = None  # UrlJobBase
     impersonate: str | None = None  # UrlJob (curl_cffi backend only)
@@ -123,8 +192,9 @@ class JobBase(metaclass=TrackSubClasses):
     initialization_js: str | None = None  # BrowserJob
     initialization_url: str | None = None  # UrlJob, BrowserJob
     is_markdown: bool | None = None
+    is_rst: bool | None = None
     kind: str | None = None  # hooks.py
-    loop: asyncio.AbstractEventLoop | None = None
+    markdown_extras: dict[str, Any] | None = None
     markdown_padded_tables: bool | None = None
     max_tries: int | None = None
     method: Literal['GET', 'OPTIONS', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'] | None = None  # UrlJobBase
@@ -141,13 +211,15 @@ class JobBase(metaclass=TrackSubClasses):
     retries: int | None = None  # UrlJob
     same_site_delay: float | None = None  # UrlJobBase
     ssl_no_verify: bool | None = None  # UrlJob
-    stderr: str | None = None  # urlwatch backwards compatibility for ShellJob (not used)
+    stderr: str | None = None  # ShellJob (from urlwatch)
     stealth: bool | None = None  # BrowserJob
     suppress_error_ended: bool | None = None
     suppress_errors: bool | None = None
     suppress_repeated_errors: bool | None = None
     switches: list[str] | None = None  # BrowserJob
+    tags: str | list[str] | None = None
     timeout: float | None = None  # UrlJobBase
+    treat_new_as_changed: bool | None = None
     tz: str | None = None  # added by with_defaults, taken from reporter configuration
     user_data_dir: str | None = None  # BrowserJob
     user_visible_url: str | None = None
@@ -160,22 +232,7 @@ class JobBase(metaclass=TrackSubClasses):
     wait_until: Literal['commit', 'domcontentloaded', 'load', 'networkidle'] | None = None  # BrowserJob
 
     def __init__(self, **kwargs: Any) -> None:
-        # backward-compatibility
-        if 'filter' in kwargs:
-            logger.info(f"Job {kwargs.get('index_number')}: Replacing deprecated directive 'filter' with 'filters'")
-            kwargs['filters'] = kwargs.pop('filter')
-        if 'diff_filter' in kwargs:
-            logger.info(
-                f"Job {kwargs.get('index_number')}: Replacing deprecated directive 'diff_filter' with 'diff_filter'"
-            )
-            kwargs['diff_filters'] = kwargs.pop('diff_filter')
-        if 'https_proxy' in kwargs:
-            logger.info(f"Job {kwargs.get('index_number')}: Replacing deprecated directive 'https_proxy' with 'proxy'")
-            kwargs['proxy'] = kwargs.pop('https_proxy')
-            kwargs.pop('http_proxy', None)
-        elif 'http_proxy' in kwargs:
-            logger.info(f"Job {kwargs.get('index_number')}: Replacing deprecated directive 'http_proxy' with 'proxy'")
-            kwargs['proxy'] = kwargs.pop('http_proxy')
+        replace_deprecated_directives(kwargs)
 
         # Fail if any required keys are not provided
         for k in self.__required__:
@@ -240,9 +297,18 @@ class JobBase(metaclass=TrackSubClasses):
     def serialize(self) -> dict:
         """Serialize the Job object, excluding its index_number (e.g. for saving).
 
+        Unlike :py:meth:`to_dict`, it keeps the directives set to false or 0 (e.g. ``enabled: false`` or
+        ``contextlines: 0``), as these differ from leaving the directive out; empty strings and collections (e.g. the
+        empty headers of every URL job) are left out.
+
         :returns: A dict with the Job object serialized.
         """
-        d = self.to_dict()
+        d = {
+            k: headers_to_dict(v) if isinstance(v, Headers) else v
+            for keys in (self.__required__, self.__optional__)
+            for k in keys
+            if (v := getattr(self, k, None)) is not None and (isinstance(v, (bool, int, float)) or v)
+        }
         d.pop('index_number', None)
         return d
 
@@ -283,6 +349,7 @@ class JobBase(metaclass=TrackSubClasses):
             data['kind'] = 'command'
 
         # Backwards compatibility with 'navigate' directive (deprecated)
+        from_navigate = bool(data.get('navigate'))
         if data.get('navigate') and not data.get('use_browser'):
             warnings.warn(
                 f"Error in jobs file: Job directive 'navigate' is deprecated: replace with 'url' and add 'use_browser: "
@@ -292,6 +359,36 @@ class JobBase(metaclass=TrackSubClasses):
             )
             data['url'] = data.get('url', data['navigate'])
             data['use_browser'] = True
+        if data.get('use_browser') and data.get('url'):
+            # Translated: a browser job with 'navigate' set fails, and saving the job would write both directives
+            data.pop('navigate', None)
+
+        # Backwards compatibility with urlwatch's browser job directives 'useragent' and 'browser' (deprecated)
+        if 'useragent' in data:
+            logger.warning(
+                "Job directive 'useragent' is deprecated: replace it with a 'User-Agent' header in 'headers' (job %s)",
+                data.get('url'),
+            )
+            useragent = data.pop('useragent')
+            headers = dict(data.get('headers') or {})
+            if useragent and not any(key.lower() == 'user-agent' for key in headers):
+                headers['User-Agent'] = useragent
+            data['headers'] = headers
+        if 'browser' in data:
+            logger.warning(
+                "Job directive 'browser' is deprecated: replace it with 'use_browser: <browser>' (job %s)",
+                data.get('url'),
+            )
+            browser = data.pop('browser')
+            # Only for browser jobs (urlwatch's 'navigate' ones); its default 'chromium' is webchanges' default browser
+            if browser and browser != 'chromium' and data.get('use_browser') is True:
+                data['use_browser'] = browser
+        # urlwatch's 'wait_for' waits for an element matching a selector (webchanges' own former 'wait_for' is rejected)
+        if from_navigate and isinstance(data.get('wait_for'), str) and not data.get('wait_for_selector'):
+            logger.warning(
+                "Job directive 'wait_for' is deprecated: replace it with 'wait_for_selector' (job %s)", data.get('url')
+            )
+            data['wait_for_selector'] = data.pop('wait_for')
 
         # Backwards-compatible with diff_tool
         if data.get('diff_tool') and not data.get('differ'):
@@ -303,6 +400,14 @@ class JobBase(metaclass=TrackSubClasses):
             raise ValueError(
                 f"Error in jobs file: Job directive 'differ: {data['differ']}' has to be a string or dict:\n"
                 f'{yaml.safe_dump(data)}'
+            )
+
+        # 'url' and 'command' each identify a different job kind and are mutually exclusive (as the jobs.schema.json
+        # JSON Schema declares); a job with both used to be silently run as a 'command' one, ignoring the URL.
+        if data.get('url') and data.get('command'):
+            raise ValueError(
+                f"Error in jobs file: Job directives 'url' and 'command' are mutually exclusive (a job monitors "
+                f'either a URL or the output of a command):\n{yaml.safe_dump(data)}'
             )
 
         if 'kind' in data:
@@ -357,9 +462,9 @@ class JobBase(metaclass=TrackSubClasses):
 
         # Format headers and cookies (and turn values into strings to avoid httpx Exception):
         if isinstance(job.headers, dict):
-            job.headers = Headers({k: str(v) for k, v in (job.headers or {}).items()}, encoding='utf-8')
+            job.headers = headers_from_dict(job.headers)
         if isinstance(job.cookies, dict):
-            job.cookies = {k: str(v) for k, v in job.cookies.items()} if job.cookies is not None else None
+            job.cookies = cookies_from_dict(job.cookies)
 
         # Add GUID
         job.guid = job.get_guid()
@@ -367,13 +472,17 @@ class JobBase(metaclass=TrackSubClasses):
         return job
 
     def to_dict(self) -> dict:
-        """Return all defined (not None) Job object directives, required and optional, as a serializable dict,
+        """Return all Job object directives with a truthy value, required and optional, as a serializable dict,
         converting Headers object (which are not JSON serializable) to dicts.
 
         :returns: A dict with all job directives as keys, ignoring those that are extras.
         """
+        # Deliberately drops every falsy value (False, 0, '', empty collections), unlike serialize(), which keeps False
+        # and 0 because saving must not lose e.g. 'enabled: false'. Do not make the two consistent: RegexMatchFilter
+        # (filters/_base.py), also subclassed in users' hooks.py, runs regexes over these values and would raise
+        # TypeError on a False or 0; the WEBCHANGES_*_JSON environment variables of reporters and filters also use it.
         return {
-            k: dict(getattr(self, k)) if isinstance(getattr(self, k), Headers) else getattr(self, k)
+            k: headers_to_dict(getattr(self, k)) if isinstance(getattr(self, k), Headers) else getattr(self, k)
             for keys in {self.__required__, self.__optional__}
             for k in keys
             if hasattr(self, k) and getattr(self, k)
@@ -384,12 +493,13 @@ class JobBase(metaclass=TrackSubClasses):
         """Create a JobBase class from a dict, checking that all keys are recognized (i.e. listed in __required__ or
         __optional__).
 
-        :param data: Job data in dict format (e.g. from the YAML jobs file).
+        :param data: Job data in dict format (e.g. from the YAML jobs file); it is modified in place.
         :returns: A JobBase type object.
         """
+        replace_deprecated_directives(data)
+        recognized = set(cls.__required__).union(cls.__optional__)
         for k in data:
-            # backward-compatibility
-            if k not in cls.__required__ + cls.__optional__ + ('filter', 'diff_filter', 'http_client', 'http_proxy'):
+            if k not in recognized:
                 if len(filenames) > 1:
                     jobs_files = ['in the concatenation of the jobs files:'] + [f'• {file},' for file in filenames]
                 elif len(filenames) == 1:
@@ -438,20 +548,30 @@ class JobBase(metaclass=TrackSubClasses):
         return destination
 
     def _set_defaults(self, defaults: dict[str, Any] | None) -> None:
-        """Merge default attributes (e.g. from configuration) into those of the Job object.
+        """Merge default attributes (e.g. from configuration) into those of the Job object, without overwriting any.
+
+        A directive the job already has keeps its value, except that a dict-valued one (e.g. ``headers``, ``cookies``)
+        is merged key by key, one level deep: the default's keys missing from the job's are added (case-insensitively
+        for ``headers``, as both are ``Headers`` objects), the others are left untouched. A list (e.g. ``filters``) is
+        never merged. Called repeatedly, the first call's defaults win over the later ones'.
 
         :param defaults: The default Job parameters.
         """
         if isinstance(defaults, dict):
-            # merge defaults from configuration (including dicts) into Job attributes without overwriting them
             for key, value in defaults.items():
                 if key in self.__optional__:
-                    if getattr(self, key) is None:  # for speed
+                    attribute = getattr(self, key, None)
+                    if attribute is None:  # for speed
                         setattr(self, key, value)
-                    elif isinstance(value, (dict, Headers)) and isinstance(getattr(self, key), (dict, Headers)):
+                    elif isinstance(value, (dict, Headers)) and isinstance(attribute, (dict, Headers)):
+                        # Merge into a copy and assign it, never merge in place: a directive that this job does not
+                        # set itself reads the class attribute (e.g. the shared, mutable JobBase.headers), and
+                        # mutating that would leak these defaults into every other job of the run.
+                        merged = copy.deepcopy(attribute)
                         for subkey, subvalue in value.items():
-                            if hasattr(self, key) and subkey not in getattr(self, key):
-                                getattr(self, key)[subkey] = subvalue
+                            if subkey not in merged:
+                                merged[subkey] = subvalue
+                        setattr(self, key, merged)
                     # elif isinstance(defaults[key], list) and isinstance(getattr(self, key), list):
                     #     setattr(self, key, list(set(getattr(self, key) + defaults[key])))
 
@@ -467,13 +587,15 @@ class JobBase(metaclass=TrackSubClasses):
 
         cfg = config.get('job_defaults')
         if isinstance(cfg, dict):
-            # Apply defaults specific to this job kind, then 'all' defaults (which don't override more specific ones)
+            # Apply defaults specific to this job kind, then 'all_jobs' ones. As _set_defaults never overwrites, the
+            # precedence is: the job's directive > the kind's default > the all_jobs default; for headers (and any other
+            # dict-valued directive) this holds header by header, e.g. a job's User-Agent replaces only the default
+            # User-Agent, and all the other default headers are still sent.
             for class_type in (UrlJob, BrowserJob, ShellJob):
                 if isinstance(self, class_type):
-                    job_with_defaults._set_defaults(cfg.get(class_type.__kind__))
+                    job_with_defaults._set_defaults(cfg.get(f'{class_type.__kind__}_jobs'))
                     break
-            # all is done last, so that more specific defaults are not overwritten
-            job_with_defaults._set_defaults(cfg.get('all'))
+            job_with_defaults._set_defaults(cfg.get('all_jobs'))
 
         # backwards-compatible
         if hasattr(job_with_defaults, 'diff_tool'):
@@ -532,12 +654,6 @@ class JobBase(metaclass=TrackSubClasses):
         """
         raise NotImplementedError
 
-    def main_thread_enter(self) -> None:
-        """Called from the main thread before running the job. No longer needed (does nothing)."""
-
-    def main_thread_exit(self) -> None:
-        """Called from the main thread after running the job. No longer needed (does nothing)."""
-
     def format_error(self, exception: Exception, tb: str) -> str:
         """Format the error of the job if one is encountered.
 
@@ -545,6 +661,11 @@ class JobBase(metaclass=TrackSubClasses):
         :param tb: The traceback.format_exc() string.
         :returns: A string to display and/or use in reports.
         """
+        if isinstance(exception, TransientHTTPError):
+            # Instead of a full traceback, just show the error: it describes a condition of the monitored resource
+            # (e.g. an HTTP 503 response, or no data received) and not a failure of webchanges, so a stack trace
+            # would only be alarming noise.
+            return str(exception).strip()
         return tb
 
     def ignore_error(self, exception: Exception) -> bool:
@@ -562,6 +683,26 @@ class JobBase(metaclass=TrackSubClasses):
         :returns: Whether the job is enabled.
         """
         return self.enabled is None or self.enabled
+
+    def tags_set(self) -> set[str]:
+        """Returns the job's tags as a set (the 'tags' directive accepts either a single tag or a list of them).
+
+        :returns: The set of the job's tags; empty if the job has no 'tags' directive.
+        """
+        if not self.tags:
+            return set()
+        if isinstance(self.tags, str):
+            return {self.tags}
+        return set(self.tags)
+
+    def matching_tags(self, tags: Iterable[str]) -> set[str]:
+        """Returns the job's tags that are also in ``tags``. Used to select the jobs to run (``--tags``) and those a
+        reporter reports on (a reporter's 'tags' configuration directive).
+
+        :param tags: The tags to match the job's tags against.
+        :returns: The intersection of the job's tags and ``tags``; empty (i.e. falsy) if the job matches none of them.
+        """
+        return self.tags_set().intersection(tags)
 
     def set_to_monospace(self) -> None:
         """If unset, sets the monospace flag to True (will not override)."""
@@ -599,11 +740,15 @@ class Job(JobBase):
         'differ',
         'diff_filters',
         'diff_tool',  # deprecated in 3.21
+        'empty_as_error',
         'enabled',
         'filters',
+        'hook_data',  # hooks.py
         'index_number',
         'is_markdown',
+        'is_rst',
         'kind',  # hooks.py
+        'markdown_extras',
         'markdown_padded_tables',
         'max_tries',
         'monospace',
@@ -613,6 +758,8 @@ class Job(JobBase):
         'suppress_error_ended',
         'suppress_errors',
         'suppress_repeated_errors',
+        'tags',
+        'treat_new_as_changed',
         'user_visible_url',
     )
 
@@ -678,30 +825,48 @@ class UrlJobBase(Job):
         'timeout',
     )
 
+    def get_cookies(self) -> dict[str, str] | None:
+        """Get the cookies to send, i.e. those of the 'cookies' directive (merged with job_defaults) not set to null.
+
+        :returns: The cookies, or None if there are none.
+        """
+        if not self.cookies:
+            return None
+        if not isinstance(self.cookies, dict):
+            raise TypeError(
+                f"Job {self.index_number}: Directive 'cookies' needs to be a dictionary; "
+                f"found a '{type(self.cookies).__name__}' ( {self.get_indexed_location()} ).'"
+            )
+        cookies = {k: v for k, v in self.cookies.items() if v is not None}
+        if len(cookies) < len(self.cookies):
+            removed = ', '.join(k for k, v in self.cookies.items() if v is None)
+            logger.debug('Job %s: Not sending cookie(s) set to null: %s', self.index_number, removed)
+        return cookies or None
+
     def get_headers(
         self,
         job_state: JobState,
         user_agent: str | None = __user_agent__,
         include_cookies: bool = True,
     ) -> Headers:
-        """Get headers and modify them to add cookies and conditional request. If headers don't
-        contain `User-Agent`, either the default one or the one provided as `user_agent` is added.
+        """Get headers and modify them to add cookies and conditional request. Headers set to null (removed) are
+        dropped first; then, if headers don't contain `User-Agent`, either the default one or the one provided as
+        `user_agent` is added.
 
         :param job_state: The job state.
         :param user_agent: The user agent string.
-        :include_cookies: Whether to include cookies (from `self.cookies`) as a `Cookie` header.
+        :include_cookies: Whether to include cookies (from `get_cookies()`) as a `Cookie` header.
 
         :returns: The headers.
         """
         headers = self.headers.copy() if self.headers else Headers(encoding='utf-8')
+        if removed := [k for k, v in headers.items() if v == REMOVED_HEADER]:
+            logger.debug('Job %s: Not sending header(s) set to null: %s', self.index_number, ', '.join(removed))
+            for name in removed:
+                del headers[name]
         if 'User-Agent' not in headers and user_agent:
             headers['User-Agent'] = user_agent
-        if include_cookies and self.cookies:
-            if not isinstance(self.cookies, dict):
-                raise TypeError(
-                    f"Job {self.index_number}: Directive 'cookies' needs to be a dictionary; "
-                    f"found a '{type(self.cookies).__name__}' ( {self.get_indexed_location()} ).'"
-                )
+        if include_cookies and (cookies := self.get_cookies()):
             if 'Cookie' in headers:
                 warnings.warn(
                     f"Job {self.index_number}: Found both a header 'Cookie' and a directive 'cookies'; "
@@ -710,7 +875,7 @@ class UrlJobBase(Job):
                     RuntimeWarning,
                     stacklevel=1,
                 )
-            headers['Cookie'] = '; '.join([f'{k}={v}' for k, v in self.cookies.items()])
+            headers['Cookie'] = '; '.join([f'{k}={v}' for k, v in cookies.items()])
         if self.no_conditional_request:
             headers.pop('If-Modified-Since', None)
             headers.pop('If-None-Match', None)

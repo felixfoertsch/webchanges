@@ -4,11 +4,15 @@
 
 from __future__ import annotations
 
+__lazy_modules__ = ['pathlib', 'shutil']
+
 import logging
+import os
+import re
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Mapping, TypeVar
+from typing import Any, Mapping, cast
 
 import yaml
 
@@ -17,21 +21,60 @@ from webchanges.filters import FilterBase
 from webchanges.jobs import JobBase, ShellJob
 from webchanges.util import edit_file, file_ownership_checks
 
-# TypeVar that is compatible with TypedDict structures
-T = TypeVar('T', bound=Mapping[str, object])
-
 logger = logging.getLogger(__name__)
 
 
 # Custom YAML constructor for !include
+# TODO: !include is untested — work in progress; do not document yet.
 def yaml_include(loader: yaml.SafeLoader, node: yaml.Node) -> list[Any]:
     file_path = Path(loader.name).parent.joinpath(node.value)
     with file_path.open('r') as f:
         return list(yaml.safe_load_all(f))
 
 
-# Add the custom constructor to the YAML loader
+# Matches ${VAR} and ${VAR:-default} environment variable references in scalars tagged !env
+ENV_TAG_RE = re.compile(r'\$\{(\w+)(?::-([^}]*))?\}')
+
+
+def yaml_env(loader: yaml.SafeLoader, node: yaml.Node) -> str:
+    """Custom YAML constructor for !env: substitute environment variable references in a scalar.
+
+    Each ``${VAR}`` reference is replaced with the value of the environment variable ``VAR``; the bash-style
+    ``${VAR:-default}`` form falls back to ``default`` when ``VAR`` is not set. The result is always a string.
+
+    :param loader: The YAML loader.
+    :param node: The scalar node tagged with !env.
+    :return: The scalar with all environment variable references substituted.
+    :raises yaml.constructor.ConstructorError: If a referenced variable is not set and no default is given.
+    """
+    # The registered constructor must accept any Node, but !env is only valid on scalars; construct_scalar raises
+    # ConstructorError at runtime if the node is not a scalar.
+    value = loader.construct_scalar(cast('yaml.ScalarNode', node))
+
+    def _replace(match: re.Match[str]) -> str:
+        name, default = match.groups()
+        env_value = os.environ.get(name)
+        if env_value is not None:
+            return env_value
+        if default is not None:
+            logger.debug('!env tag: environment variable %s is not set; using its default value', name)
+            return default
+        raise yaml.constructor.ConstructorError(
+            None, None, f"environment variable '{name}' is not set and no default is given", node.start_mark
+        )
+
+    names = [match.group(1) for match in ENV_TAG_RE.finditer(value)]
+    if names:
+        # Log the variable names only: their values may be secrets
+        logger.debug('!env tag: substituting environment variable(s) %s', ', '.join(names))
+    else:
+        logger.warning('!env tag: no ${VAR} reference found in %r', value)
+    return ENV_TAG_RE.sub(_replace, value)
+
+
+# Add the custom constructors to the YAML loader
 yaml.add_constructor('!include', yaml_include, Loader=yaml.SafeLoader)
+yaml.add_constructor('!env', yaml_env, Loader=yaml.SafeLoader)
 
 
 class BaseStorage(ABC):  # noqa:  B024 abstract base class, but it has no abstract methods or properties
@@ -132,17 +175,21 @@ class BaseTextualFileStorage(BaseFileStorage, ABC):
         print('Saved edits in', filename)
         return 0
 
-    def remove_remark_keys(self, _dict: T) -> T:
-        """Recursively removes all keys starting with '_' from a dict.
+    def remove_remark_keys[T: Mapping[str, object]](self, _dict: T) -> T:
+        """Recursively removes all keys starting with '_' from a dict. ``T`` is bound to ``Mapping`` so that TypedDict
+        structures are accepted and returned with their type intact.
 
         :param _dict: The dict.
         :return: The dict with all keys starting with '_' removed.
         """
-        return {
-            k: self.remove_remark_keys(v) if isinstance(v, dict) else v  # ty:ignore[invalid-argument-type]
-            for k, v in _dict.items()
-            if not k.startswith('_')
-        }  # ty:ignore[invalid-return-type]
+        return cast(
+            'T',
+            {
+                k: self.remove_remark_keys(cast('dict[str, Any]', v)) if isinstance(v, dict) else v
+                for k, v in _dict.items()
+                if not k.startswith('_')
+            },
+        )
 
 
 class JobsBaseFileStorage(BaseTextualFileStorage, ABC):
@@ -155,7 +202,8 @@ class JobsBaseFileStorage(BaseTextualFileStorage, ABC):
 
         :param filename: The filenames of the jobs file.
         """
-        super().__init__(filename)  # ty:ignore[invalid-argument-type]
+        # BaseFileStorage.__init__ only normalizes a single str | Path filename, which does not apply to the
+        # list[Path] held here, so the attribute is set directly without calling it.
         self.filename = filename
 
     def load_secure(self) -> list[JobBase]:
@@ -175,7 +223,7 @@ class JobsBaseFileStorage(BaseTextualFileStorage, ABC):
             if isinstance(job, ShellJob):
                 return True
 
-            for filter_kind, _ in FilterBase.normalize_filter_list(job.filters, job.index_number):  # ty:ignore[invalid-argument-type]
+            for filter_kind, _ in FilterBase.normalize_filter_list(job.filters, job.index_number):
                 if filter_kind == 'shellpipe':
                     return True
 

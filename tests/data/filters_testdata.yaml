@@ -82,6 +82,40 @@ xpath_exclude:
     expected_result: |-
         <div>foo</div>
         <div id="bar">bar</div>
+xpath_exclude_only:
+    filters:
+      - xpath:
+          exclude: //*[@class='excl']
+    data: |
+        <html><head></head><body>
+        <div class="excl">you don't want to see me</div>
+        <div>foo</div>
+        </body></html>
+    expected_result: |-
+        <html>
+        <head></head>
+        <body>
+
+        <div>foo</div>
+        </body>
+        </html>
+css_exclude_only:
+    filters:
+      - css:
+          exclude: .excl
+    data: |
+        <html><head></head><body>
+        <div class="excl">you don't want to see me</div>
+        <div>foo</div>
+        </body></html>
+    expected_result: |-
+        <html>
+        <head></head>
+        <body>
+
+        <div>foo</div>
+        </body>
+        </html>
 xpath_xml_namespaces:
     filters:
       - xpath:
@@ -215,6 +249,82 @@ json_format_subfilters:
           },
           "field2": "value"
         }
+json_format_compact:
+    filters:
+      - format-json:
+          compact: true
+    data: |
+        {"field1": {"f1.1": "value"}, "field2": [1, 2]}
+    expected_result: |-
+        {"field1":{"f1.1":"value"},"field2":[1,2]}
+xmltojson:
+    filters:
+      - xmltojson:
+    data: |
+        <?xml version="1.0" ?>
+        <issues><issue><id>1</id><title>Coffee maker</title><details>Coffee maker™ is broken.</details></issue></issues>
+    expected_result: |-
+        {
+            "issues": {
+                "issue": {
+                    "id": "1",
+                    "title": "Coffee maker",
+                    "details": "Coffee maker™ is broken."
+                }
+            }
+        }
+xmltojson_subfilters:
+    filters:
+      - xmltojson:
+          indentation: 2
+          sort_keys: true
+    data: |
+        <feed lang="en"><entry id="1">First</entry><entry id="2">Second</entry></feed>
+    expected_result: |-
+        {
+          "feed": {
+            "@lang": "en",
+            "entry": [
+              {
+                "#text": "First",
+                "@id": "1"
+              },
+              {
+                "#text": "Second",
+                "@id": "2"
+              }
+            ]
+          }
+        }
+xmltojson_compact:
+    filters:
+      - xmltojson:
+          compact: true
+    data: |
+        <feed lang="en"><entry id="1">First</entry><entry id="2">Second</entry></feed>
+    expected_result: |-
+        {"feed":{"@lang":"en","entry":[{"@id":"1","#text":"First"},{"@id":"2","#text":"Second"}]}}
+xmltojson_invalid_xml:
+    filters:
+      - xmltojson:
+    data: <issues><issue>
+    expected_result: |-
+        Filter 'xmltojson' returned ExpatError: no element found: line 1, column 15
+
+        <issues><issue>
+xmltoyaml:
+    filters:
+      - xmltoyaml:
+    data: |
+        <feed lang="en"><entry id="1">First</entry><entry id="2">Second</entry></feed>
+    expected_result: |
+        feed:
+          '@lang': en
+          entry:
+          - '@id': '1'
+            '#text': First
+          - '@id': '2'
+            '#text': Second
 sha1:
     filters:
       - sha1sum:
@@ -229,6 +339,44 @@ hexdump:
     expected_result: |-
         48 65 6c 6c 6f 20 77 6f 72 6c 64 21 0a e4 bd a0  Hello world!....
         e5 a5 bd ef bc 8c e4 b8 96 e7 95 8c ef bc 81     ...............
+remove_repeated_adjacent:
+    filters:
+      - remove_repeated:
+    data: |-
+        b
+        b
+        ab
+        b
+    expected_result: |-
+        b
+        ab
+        b
+remove_repeated_non_adjacent:
+    filters:
+      - remove_repeated:
+          adjacent: false
+    data: |-
+        a
+        b
+        a
+        c
+    expected_result: |-
+        a
+        b
+        c
+remove_repeated_ignore_case:
+    filters:
+      - remove_repeated:
+          ignore_case: true
+    data: |-
+        b
+        B
+        AB
+        b
+    expected_result: |-
+        b
+        AB
+        b
 sort:
     filters:
       - sort:
