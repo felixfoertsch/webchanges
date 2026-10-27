@@ -69,6 +69,9 @@ class PublishTest(unittest.TestCase):
         self.calls.append(args)
         if args[:2] == ('api', '--paginate'):
             return json.dumps([self.refs] if args[-1].endswith('/git/refs/tags') else [self.releases])
+        if args[:3] == ('api', '--method', 'POST'):
+            self.releases = [self.release]
+            return json.dumps(self.release)
         if args[:1] == ('api',):
             endpoint = args[-1]
             if endpoint.endswith('/git/ref/heads/main'):
@@ -142,7 +145,7 @@ class PublishTest(unittest.TestCase):
 
     def test_create_draft_and_retry_upload_missing(self):
         self.publish()
-        self.assertTrue(any(c[:2] == ('release', 'create') and '--draft' in c for c in self.calls))
+        self.assertTrue(any(c[:3] == ('api', '--method', 'POST') and 'draft=true' in c for c in self.calls))
         self.assertTrue(any(c[:2] == ('release', 'edit') for c in self.calls))
         self.calls.clear()
         self.releases = [self.release]

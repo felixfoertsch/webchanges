@@ -105,25 +105,14 @@ def publish(repo, tag, sha, nightly, files):
     if len(matches) > 1:
         raise ValueError('duplicate release')
     if not matches:
-        flags = ['--prerelease', '--latest=false'] if nightly else ['--latest']
-        gh(
-            'release',
-            'create',
-            tag,
-            '--repo',
-            repo,
-            '--target',
-            sha,
-            '--draft',
-            '--title',
-            tag,
-            '--notes',
-            f'Source: {sha}',
-            *flags,
-        )
-    if not matches:
-        pages = json.loads(gh('api', '--paginate', '--slurp', f'repos/{repo}/releases'))
-        matches = [r for page in pages for r in page if r['tag_name'] == tag]
+        created = json.loads(gh(
+            'api', '--method', 'POST', f'repos/{repo}/releases',
+            '-f', f'tag_name={tag}', '-f', f'target_commitish={sha}',
+            '-f', f'name={tag}', '-f', f'body=Source: {sha}',
+            '-F', 'draft=true', '-F', f'prerelease={str(nightly).lower()}',
+            '-f', 'make_latest=false' if nightly else 'make_latest=true',
+        ))
+        matches = [created]
     if len(matches) != 1:
         raise ValueError('expected one release after creation')
     endpoint = f'repos/{repo}/releases/{matches[0]["id"]}'
